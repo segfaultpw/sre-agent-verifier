@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Verifier image: Elixir. Build with the verifier/ directory as the context:
+#   docker build -f verifier/images/elixir/Dockerfile verifier/
+# The base is pinned by the digest of the multi-arch index (amd64 and arm64), of a tag
+# the publisher re-points (the official image is rebuilt on every Debian update), so
+# the weekly refresh (verifier/refresh-bases.sh) and Dependabot can move it. The
+# platform's own builder uses hexpm/elixir, whose tags name a dated build and never move;
+# that is why this image does not. Same Elixir and OTP major as the platform builds with.
+FROM elixir:1.20.4-otp-29-slim@sha256:2a26b8aac0cdbd004c646eb51d8791fa4d2f102359b40a9717cd988523532bf6
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bash ca-certificates curl git jq util-linux coreutils build-essential \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --create-home --uid 10001 --shell /bin/bash sandbox \
+ && mkdir -p /work /etc/verifier \
+ && chmod 0711 /work
+
+COPY run.sh /usr/local/bin/verifier-run
+COPY images/elixir/step.env /etc/verifier/step.env
+RUN chmod 0755 /usr/local/bin/verifier-run
+
+# Hex and rebar are installed for the unprivileged user, which is the one that
+# runs every command of the repository under test.
+USER sandbox
+RUN mix local.hex --force && mix local.rebar --force
+USER root
+
+ENV VERIFIER_RUNTIME=elixir
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/verifier-run"]

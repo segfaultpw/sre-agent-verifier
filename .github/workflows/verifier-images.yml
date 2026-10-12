@@ -1,0 +1,167 @@
+name: Verifier images
+
+# Builds, contract-tests, scans and publishes the SRE Agent verifier images
+# (verifier/images/<runtime>), for amd64 and arm64, each on a native runner. The leg that
+# builds an image is the leg that tests, scans and pushes it, so what is published is the
+# very image that was checked. An image that fails its contract or carries a fixable HIGH
+# or CRITICAL vulnerability is never published, and each runtime is published on its own.
+# A weekly rebuild re-resolves every pinned base to its tag's current digest first, so OS
+# and toolchain fixes reach the images within a week. Each merged image's digest is
+# printed in the job summary.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "verifier/**"
+      - ".github/workflows/verifier-images.yml"
+  pull_request:
+    paths:
+      - "verifier/**"
+      - ".github/workflows/verifier-images.yml"
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: verifier-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Stable across the legs of one run, unique per run: a weekly rebuild of the same
+  # commit is a new tag, not an overwrite.
+  TAG: ${{ github.sha }}-r${{ github.run_number }}
+
+jobs:
+  image:
+    name: ${{ matrix.runtime }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [elixir, node, python, go, java, php]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+          - arch: arm64
+            platform: linux/arm64
+            runner: ${{ vars.RUNNER_ARM64 || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/sre-agent-verifier-${{ matrix.runtime }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint the runner and the image scripts
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(find verifier -name '*.sh' | sort)
+          for script in "${scripts[@]}"; do bash -n "$script"; done
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning "${scripts[@]}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Re-resolve the base digests (weekly rebuild)
+        if: github.event_name == 'schedule'
+        run: bash verifier/refresh-bases.sh "verifier/images/${{ matrix.runtime }}/Dockerfile"
+
+      - name: Runner contract inside the image (this architecture, natively)
+        env:
+          # The weekly rebuild takes nothing from a cache: a layer built weeks ago
+          # holds weeks-old packages.
+          VERIFIER_BUILD_ARGS: ${{ github.event_name == 'schedule' && '--no-cache' || '' }}
+        run: bash verifier/test/contract.sh "${{ matrix.runtime }}"
+
+      - name: Trivy scan (blocking on fixable HIGH and CRITICAL), this architecture's image
+        # Pinned image rather than a floating action ref: a security job should
+        # not pull an unpinned third party at head. An image directory may carry
+        # *.openvex.json statements (a scoped, reasoned exception for one advisory on
+        # one package, see verifier/contract.md); they are handed to the scan with
+        # --vex, and an image without any is scanned with nothing suppressed. Each is
+        # checked here first, so this workflow refuses a broader exception on its own:
+        # verifier/check-vex.sh knows the one exception each runtime is allowed.
+        run: |
+          set -euo pipefail
+          bash verifier/check-vex.sh "${{ matrix.runtime }}"
+          docker_vex=()
+          trivy_vex=()
+          for vex in verifier/images/${{ matrix.runtime }}/*.openvex.json; do
+            [ -e "$vex" ] || continue
+            docker_vex+=(-v "$PWD/$vex:/vex/$(basename "$vex"):ro")
+            trivy_vex+=(--vex "/vex/$(basename "$vex")")
+          done
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            "${docker_vex[@]}" \
+            aquasec/trivy:0.58.1 image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --no-progress \
+              --exit-code 1 \
+              "${trivy_vex[@]}" \
+              "verifier-contract-${{ matrix.runtime }}:local"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the image that was tested and scanned
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          docker tag "verifier-contract-${{ matrix.runtime }}:local" "$IMAGE:$TAG-${{ matrix.arch }}"
+          docker push "$IMAGE:$TAG-${{ matrix.arch }}"
+
+  merge:
+    name: merge ${{ matrix.runtime }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    needs: image
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [elixir, node, python, go, java, php]
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/sre-agent-verifier-${{ matrix.runtime }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge the two architectures into one multi-arch image
+        run: |
+          set -euo pipefail
+          # Only a leg that passed its contract and its scan pushed its image, so a
+          # missing one means this runtime is not published this run, and says which.
+          for arch in amd64 arm64; do
+            if ! docker buildx imagetools inspect "$IMAGE:$TAG-$arch" >/dev/null 2>&1; then
+              echo "::error::$IMAGE:$TAG-$arch was not pushed (its leg failed), so ${{ matrix.runtime }} is not published this run"
+              exit 1
+            fi
+          done
+          docker buildx imagetools create -t "$IMAGE:$TAG" -t "$IMAGE:latest" \
+            "$IMAGE:$TAG-amd64" \
+            "$IMAGE:$TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+
+      - name: Digest
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')
+          echo "$IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"

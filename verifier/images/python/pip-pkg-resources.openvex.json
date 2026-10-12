@@ -1,0 +1,22 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/segfaultpw/sre-agent-verifier/blob/main/verifier/images/python/pip-pkg-resources.openvex.json",
+  "author": "sre-agent verifier images",
+  "timestamp": "2026-10-07T12:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2025-47273"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/setuptools@70.3.0"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "pip vendors only pkg_resources/__init__.py of setuptools 70.3.0 (pip/_vendor/pkg_resources). The advisory is a path traversal in PackageIndex, which lives in setuptools/package_index.py; that module, and setuptools itself, are not in the image. The scanner reads the setuptools entry out of pip's own bom.cdx.json."
+    }
+  ]
+}
