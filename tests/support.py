@@ -93,3 +93,40 @@ def job_blocks(workflow_text):
             blocks[current].append(line)
     return {job: "\n".join(body) for job, body in blocks.items()}
 
+
+
+_KEY_LINE = re.compile(r"^(\s*)((?:- )*)([A-Za-z_][A-Za-z0-9_.-]*):(?:\s+(.*))?$")
+
+
+def plain_scalars_with_a_colon(workflow_text):
+    """Returns the `key: value` lines whose plain scalar value holds `: ` (or ends in a colon).
+
+    YAML reads that as a nested mapping and refuses the file, so GitHub runs no workflow at
+    all; an unquoted `name:`, `if:` or one-line `run:` is where it happens. Block scalar
+    bodies (`run: |`) are shell and are skipped, and so are quoted and flow values.
+    """
+    found = []
+    block_column = None
+    for number, line in enumerate(workflow_text.split("\n"), start=1):
+        if block_column is not None:
+            if not line.strip() or len(line) - len(line.lstrip()) > block_column:
+                continue
+            block_column = None
+        if line.lstrip().startswith("#"):
+            continue
+        match = _KEY_LINE.match(line)
+        if not match:
+            continue
+        column = len(match.group(1)) + 2 * match.group(2).count("- ")
+        value = (match.group(4) or "").strip()
+        if not value:
+            continue
+        if value[0] in "|>":
+            block_column = column
+            continue
+        if value[0] in "'\"[{&*!":
+            continue
+        value = re.sub(r"\s#.*$", "", value)
+        if ": " in value or value.endswith(":"):
+            found.append((number, line.strip()))
+    return found

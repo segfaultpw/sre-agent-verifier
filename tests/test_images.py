@@ -37,7 +37,7 @@ class ImagePerRuntimeTest(unittest.TestCase):
         )
 
     def test_the_contract_names_exactly_these_runtimes(self):
-        line = re.search(r"^One per runtime: (.*?)\.$", read(CONTRACT), re.M | re.S)
+        line = re.search(r"^One per runtime: (.*?)\. Each is built", read(CONTRACT), re.M | re.S)
         self.assertIsNotNone(line)
         named = re.findall(r"`([a-z]+)`", line.group(1))
         self.assertEqual(sorted(named), sorted(RUNTIMES))
@@ -93,13 +93,24 @@ class EachImageTest(unittest.TestCase):
 
 
 class PinnedToolchainTest(unittest.TestCase):
-    def test_the_go_image_pins_the_toolchain_to_go_1_26_9(self):
+    def test_the_go_image_follows_the_floating_tag_of_a_go_line_from_1_26_on(self):
+        # A patch tag such as 1.26.9-trixie stops being re-pointed once the next patch ships, so
+        # the weekly refresh could never move it; the 1.26.9 floor is checked on the built image
+        # by verifier/test/contract.sh instead.
         froms = [FROM_LINE.match(l) for l in dockerfile("go").split("\n") if l.startswith("FROM ")]
-        self.assertEqual([m.group(1) for m in froms], ["golang:1.26.9-trixie"])
+        (ref,) = [m.group(1) for m in froms]
+        match = re.fullmatch(r"golang:1\.(\d+)-trixie", ref)
+        self.assertIsNotNone(match, "%s is not the floating tag of a Go line" % ref)
+        self.assertGreaterEqual(int(match.group(1)), 26, "%s is below the Go 1.26 line" % ref)
 
-    def test_the_node_image_stays_on_the_24_lts_line(self):
+    def test_the_node_image_stays_on_an_even_lts_major_from_24_on(self):
         froms = [FROM_LINE.match(l) for l in dockerfile("node").split("\n") if l.startswith("FROM ")]
-        self.assertEqual([m.group(1) for m in froms], ["node:24-trixie-slim"])
+        (ref,) = [m.group(1) for m in froms]
+        match = re.fullmatch(r"node:(\d+)-trixie-slim", ref)
+        self.assertIsNotNone(match, "%s is not a node major on trixie-slim" % ref)
+        major = int(match.group(1))
+        self.assertGreaterEqual(major, 24, "%s is below Node 24" % ref)
+        self.assertEqual(major % 2, 0, "%s is not a long-term support (even) major" % ref)
 
     def test_the_java_image_stays_on_an_lts_jdk(self):
         froms = [FROM_LINE.match(l) for l in dockerfile("java").split("\n") if l.startswith("FROM ")]
@@ -267,11 +278,13 @@ class BaseImagesDoNotGoStaleTest(unittest.TestCase):
         dependabot = read(DEPENDABOT)
         self.assertRegex(dependabot, r"(?m)^  - package-ecosystem: github-actions$")
 
-    def test_dependabot_ignores_the_elixir_image_minor_and_major_bumps(self):
+    def test_dependabot_ignores_the_elixir_image_minor_and_major_bumps_under_the_name_the_image_has(self):
         entry = self.docker_entry()
+        self.assertIn("FROM elixir:", dockerfile("elixir"))
+        self.assertNotIn("hexpm/elixir", entry)
         self.assertRegex(
             entry,
-            r"dependency-name: hexpm/elixir\n\s+update-types:\n\s+- \"version-update:semver-major\"\n\s+- \"version-update:semver-minor\"",
+            r"dependency-name: elixir\n\s+update-types:\n\s+- \"version-update:semver-major\"\n\s+- \"version-update:semver-minor\"",
         )
 
     def test_dependabot_ignores_the_non_lts_majors_of_node_and_the_jdk(self):
@@ -281,14 +294,25 @@ class BaseImagesDoNotGoStaleTest(unittest.TestCase):
         for odd in ["25", "27", "29"]:
             self.assertRegex(node.group(1), r">= %s, < %d" % (int(odd), int(odd) + 1))
 
+        self.assertIn("FROM maven:3-eclipse-temurin-", dockerfile("java"))
         maven = re.search(r"dependency-name: maven\n\s+versions:\n((?:\s+- .*\n)+)", entry)
         self.assertIsNotNone(maven, "no ignore rule for the JDK")
-        ranges = re.findall(r'">= (\d+), < (\d+)"', maven.group(1))
+        # Dependabot reads maven:3-eclipse-temurin-JDK as the version 3.JDK, so a range in
+        # plain JDK numbers (">= 22, < 25") matches no tag at all
+        ranges = re.findall(r'">= 3\.(\d+), < 3\.(\d+)"', maven.group(1))
+        self.assertEqual(len(ranges), len(re.findall(r"- \"", maven.group(1))), "a range is not in the 3.N form")
         ignored = {v for low, high in ranges for v in range(int(low), int(high))}
         for lts in [21, 25, 29, 33]:
             self.assertNotIn(lts, ignored, "JDK %d is an LTS and must stay reachable" % lts)
         for non_lts in [22, 23, 24, 26, 27, 28, 30, 31, 32]:
             self.assertIn(non_lts, ignored, "JDK %d is not an LTS and must be ignored" % non_lts)
+
+    def test_dependabot_does_not_take_a_maven_major_jump(self):
+        entry = self.docker_entry()
+        self.assertRegex(
+            entry,
+            r"dependency-name: maven\n\s+update-types:\n\s+- \"version-update:semver-major\"",
+        )
 
     def docker_entry(self):
         dependabot = read(DEPENDABOT)

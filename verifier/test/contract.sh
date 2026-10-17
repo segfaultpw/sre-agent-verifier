@@ -20,6 +20,9 @@
 #   * git hooks and untrusted git configuration the commands plant never run;
 #   * a sandbox user that is root is refused.
 #
+# The go image also has a toolchain floor: Go 1.26.9 or later (the release that fixes the
+# standard library advisories the scan reported), checked with `go version` in the image.
+#
 # Needs docker, git, jq and python3. No network beyond the image build.
 
 set -euo pipefail
@@ -79,8 +82,19 @@ for runtime in "${runtimes[@]}"; do
   fi
   rm -f "$build_log"
 
+  if [ "$runtime" = go ]; then
+    go_version=$(docker run --rm --entrypoint go "$tag" version) || fail "go version failed in the go image"
+    go_release=$(sed -n 's/^go version go\(1\.[0-9][0-9]*\(\.[0-9][0-9]*\)\{0,1\}\).*/\1/p' <<<"$go_version")
+    [ -n "$go_release" ] || fail "could not read a Go release from: $go_version"
+    go_minor=$(cut -d. -f2 <<<"$go_release")
+    go_patch=$(cut -d. -f3 <<<"$go_release")
+    if [ "$go_minor" -lt 26 ] || { [ "$go_minor" -eq 26 ] && [ "${go_patch:-0}" -lt 9 ]; }; then
+      fail "the go image has go$go_release, below the go1.26.9 floor"
+    fi
+  fi
+
   tmp=$(mktemp -d)
-  trap 'kill "${server_pid:-0}" 2>/dev/null || true; docker run --rm -v "$tmp:/t" busybox sh -c "rm -rf /t/* /t/.[!.]*" >/dev/null 2>&1 || true; rmdir "$tmp" 2>/dev/null || true' EXIT
+  trap '[ -z "${server_pid:-}" ] || kill "$server_pid" 2>/dev/null || true; docker run --rm -v "$tmp:/t" busybox sh -c "rm -rf /t/* /t/.[!.]*" >/dev/null 2>&1 || true; rmdir "$tmp" 2>/dev/null || true' EXIT
 
   origin="$tmp/origin"
   mkdir -p "$origin"

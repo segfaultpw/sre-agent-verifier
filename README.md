@@ -73,9 +73,10 @@ workflow runs them first, and nothing is built or published when one fails.
 ## Dependency updates
 
 Dependabot (`.github/dependabot.yml`) proposes new base digests for `verifier/images/*` and
-new versions of the GitHub Actions the workflow uses, weekly. The Go image is pinned to a
-Go patch release, Node stays on its even (long-term support) lines and the JDK on its
-long-term support releases. The weekly rebuild also re-resolves every base digest itself.
+new versions of the GitHub Actions the workflow uses, weekly. The Go image follows the
+floating tag of the 1.26 line and `verifier/test/contract.sh` fails it below Go 1.26.9, Node
+stays on its even (long-term support) lines and the JDK on its long-term support releases.
+The weekly rebuild also re-resolves every base digest itself.
 
 ## Contributing
 

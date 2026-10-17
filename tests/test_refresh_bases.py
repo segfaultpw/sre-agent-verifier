@@ -104,5 +104,77 @@ class ContractScriptWhenTheImageDoesNotBuildTest(TempDirCase):
         self.assertEqual(len([l for l in calls.split("\n") if l]), 1)
 
 
+@requires_tools("bash", "git", "jq", "python3", "sed", "cut")
+class ContractScriptGoToolchainFloorTest(TempDirCase):
+    def contract_for_go(self, version_line):
+        import os
+
+        # the build succeeds and `go version` answers what the case says; any other
+        # `docker run` (the contract itself) exits 99, which ends the script right after the floor
+        write_executable(
+            self.dir / "docker",
+            'echo "docker $*" >>"%s/calls.log"\n'
+            'case "$1" in\n'
+            "  build) exit 0 ;;\n"
+            "  run)\n"
+            '    case "$*" in\n'
+            '      *"--entrypoint go"*) echo "$GO_VERSION_LINE"; exit 0 ;;\n'
+            '      *busybox*) exit 0 ;;\n'
+            "    esac\n"
+            "    exit 99 ;;\n"
+            "esac\n"
+            "exit 99\n" % self.dir,
+        )
+        return run(
+            ["bash", VERIFIER / "test" / "contract.sh", "go"],
+            env={"PATH": "%s:%s" % (self.dir, os.environ["PATH"]), "GO_VERSION_LINE": version_line},
+        )
+
+    def test_refuses_a_go_image_older_than_1_26_9(self):
+        for line, release in [
+            ("go version go1.26.8 linux/amd64", "go1.26.8"),
+            ("go version go1.26 linux/amd64", "go1.26"),
+            ("go version go1.25.12 linux/arm64", "go1.25.12"),
+        ]:
+            with self.subTest(line=line):
+                output, status = self.contract_for_go(line)
+                self.assertNotEqual(status, 0)
+                self.assertIn("FAIL: the go image has %s, below the go1.26.9 floor" % release, output)
+                self.assertNotIn("the runner exited non-zero", output)
+
+    def test_accepts_go_1_26_9_and_later_and_goes_on_to_the_contract(self):
+        for line in [
+            "go version go1.26.9 linux/amd64",
+            "go version go1.26.10 linux/arm64",
+            "go version go1.27.0 linux/amd64",
+            "go version go1.27 linux/amd64",
+        ]:
+            with self.subTest(line=line):
+                output, status = self.contract_for_go(line)
+                self.assertNotEqual(status, 0)
+                self.assertNotIn("floor", output)
+                self.assertIn("FAIL: the runner exited non-zero", output)
+
+    def test_fails_when_go_version_prints_nothing_it_can_read(self):
+        output, status = self.contract_for_go("not a go version")
+        self.assertNotEqual(status, 0)
+        self.assertIn("FAIL: could not read a Go release from: not a go version", output)
+
+    def test_other_runtimes_are_not_asked_for_a_go_version(self):
+        import os
+
+        write_executable(
+            self.dir / "docker",
+            'echo "docker $*" >>"%s/calls.log"\n'
+            '[ "$1" = build ] && exit 0\n'
+            "exit 99\n" % self.dir,
+        )
+        run(
+            ["bash", VERIFIER / "test" / "contract.sh", "node"],
+            env={"PATH": "%s:%s" % (self.dir, os.environ["PATH"])},
+        )
+        self.assertNotIn("--entrypoint go", (self.dir / "calls.log").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,8 +22,9 @@ updates:
           - "*"
     ignore:
       # The Elixir image carries the same Elixir and Erlang the platform builds with, so
-      # only patch and digest updates come through here.
-      - dependency-name: hexpm/elixir
+      # only patch and digest updates come through here. The image is elixir:X.Y.Z-otp-N-slim,
+      # so the dependency is named elixir.
+      - dependency-name: elixir
         update-types:
           - "version-update:semver-major"
           - "version-update:semver-minor"
@@ -37,13 +38,20 @@ updates:
           - ">= 29, < 30"
           - ">= 31, < 32"
       # The JDK image follows the long-term support releases (21, 25, 29, 33), never the
-      # six-month ones in between.
+      # six-month ones in between. Its tag is maven:3-eclipse-temurin-JDK, and Dependabot
+      # reads that as the version 3.JDK (the words are dropped), so the ranges are written
+      # in that form: 3.22 to 3.24 is JDK 22 to 24, and so on.
       - dependency-name: maven
         versions:
-          - ">= 22, < 25"
-          - ">= 26, < 29"
-          - ">= 30, < 33"
-          - ">= 34, < 37"
+          - ">= 3.22, < 3.25"
+          - ">= 3.26, < 3.29"
+          - ">= 3.30, < 3.33"
+          - ">= 3.34, < 3.37"
+      # 4-eclipse-temurin-21 reads as 4.21, a jump of Maven's own major version, which this
+      # image does not take on by itself.
+      - dependency-name: maven
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: github-actions
     directory: "/"

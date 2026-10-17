@@ -5,7 +5,7 @@ here."""
 import re
 import unittest
 
-from support import RUNTIMES, WORKFLOW, job_blocks, read
+from support import RUNTIMES, WORKFLOW, job_blocks, plain_scalars_with_a_colon, read
 
 WORKFLOW_TEXT = read(WORKFLOW)
 JOBS = job_blocks(WORKFLOW_TEXT)
@@ -68,11 +68,36 @@ class SyntaxTest(unittest.TestCase):
 
     def test_has_no_tabs_and_no_plain_scalar_holding_a_colon_and_a_space(self):
         self.assertNotIn("\t", WORKFLOW_TEXT)
-        # a step or job name such as "Trivy scan (blocking: fixable)" is a YAML syntax error
-        for line in WORKFLOW_TEXT.split("\n"):
-            match = re.match(r"^\s*(?:- )?name:\s+(.*)$", line)
-            if match and not match.group(1).startswith(("'", '"')):
-                self.assertNotIn(": ", match.group(1), line)
+        # a step name such as "Trivy scan (blocking: fixable)", or an unquoted one-line
+        # `if:` or `run:` with a colon in it, is a YAML syntax error
+        self.assertEqual(plain_scalars_with_a_colon(WORKFLOW_TEXT), [])
+
+
+class PlainScalarScanTest(unittest.TestCase):
+    def test_finds_a_colon_in_any_plain_scalar_value_and_not_in_shell_bodies_or_quoted_values(self):
+        sample = "\n".join(
+            [
+                "jobs:",
+                "  a:",
+                "    steps:",
+                "      - name: Trivy scan (blocking: fixable)",
+                "      - run: echo done: yes",
+                "        if: github.ref == 'x' && format('a: {0}', b)",
+                "      - name: 'quoted: fine'",
+                '        env: "also: fine"',
+                "      - run: |",
+                "          echo a: b",
+                "          key: value",
+                "      - name: ok # a comment: here",
+                "      - run: >-",
+                "          folded: text",
+                "      - uses: actions/checkout@abc # v4: pinned",
+                "      - run: echo trailing:",
+            ]
+        )
+        self.assertEqual(
+            [number for number, _ in plain_scalars_with_a_colon(sample)], [4, 5, 6, 16]
+        )
 
     def test_every_step_has_a_name_a_uses_or_a_run(self):
         for job, block in JOBS.items():
