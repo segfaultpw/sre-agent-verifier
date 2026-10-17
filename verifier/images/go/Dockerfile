@@ -6,7 +6,7 @@
 # patches arriving. The toolchain must be Go 1.26.9 or later (the release that fixes the Go
 # standard library advisories the scan reported against the earlier 1.26 patch releases);
 # verifier/test/contract.sh fails the build of this image when `go version` is older.
-FROM golang:1.26-trixie@sha256:f06b7122f888680048afb247c4e5f49c0069eb6c4c1ccae0f3f4834527a8d22c
+FROM golang:1.27-trixie@sha256:47667934874913a449b96faa7ef4777fa285d9ec29126ee80ed61c45b7cccf0e
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
