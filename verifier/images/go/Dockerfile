@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile:1
 # Verifier image: Go. Build with the verifier/ directory as the context:
 #   docker build -f verifier/images/go/Dockerfile verifier/
-# The base is pinned by the digest of the multi-arch index (amd64 and arm64).
-FROM golang:1.26-trixie@sha256:f06b7122f888680048afb247c4e5f49c0069eb6c4c1ccae0f3f4834527a8d22c
+# The base is pinned by the digest of the multi-arch index (amd64 and arm64), and the
+# toolchain to Go 1.26.9: the release that fixes the Go standard library advisories the
+# scan reported against the earlier 1.26 patch releases. Dependabot moves the patch version.
+FROM golang:1.26.9-trixie@sha256:f06b7122f888680048afb247c4e5f49c0069eb6c4c1ccae0f3f4834527a8d22c
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

@@ -1,7 +1,8 @@
 name: Verifier images
 
-# Builds, contract-tests, scans and publishes the SRE Agent verifier images
-# (verifier/images/<runtime>), for amd64 and arm64, each on a native runner. The leg that
+# Tests, builds, contract-tests, scans and publishes the SRE Agent verifier images
+# (verifier/images/<runtime>), for amd64 and arm64, each on a native runner. The unit tests
+# (tests/) run first and nothing is built, let alone published, when one fails. The leg that
 # builds an image is the leg that tests, scans and pushes it, so what is published is the
 # very image that was checked. An image that fails its contract or carries a fixable HIGH
 # or CRITICAL vulnerability is never published, and each runtime is published on its own.
@@ -14,10 +15,12 @@ on:
     branches: [main]
     paths:
       - "verifier/**"
+      - "tests/**"
       - ".github/workflows/verifier-images.yml"
   pull_request:
     paths:
       - "verifier/**"
+      - "tests/**"
       - ".github/workflows/verifier-images.yml"
   schedule:
     - cron: "17 4 * * 1"
@@ -36,8 +39,22 @@ env:
   TAG: ${{ github.sha }}-r${{ github.run_number }}
 
 jobs:
+  unit-tests:
+    name: unit tests
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+    env:
+      # A runner that lost one of the tools the tests drive fails the run instead of
+      # skipping the tests that need it.
+      VERIFIER_TESTS_REQUIRE_TOOLS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Standard-library unit tests for the images, the scripts and this workflow
+        run: python3 -I -m unittest discover -s tests -v
+
   image:
     name: ${{ matrix.runtime }} ${{ matrix.arch }}
+    needs: unit-tests
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

@@ -302,7 +302,7 @@ image cannot be fixed by raising a library, and is recorded as a scoped exceptio
 | What the image really holds | only `pip/_vendor/pkg_resources/__init__.py` (and its licence). `PackageIndex` lives in `setuptools/package_index.py`, which is absent |
 | Why not drop or bump it | pip cannot use `pkg_resources` on Python 3.14, but pip-tools (`pip-compile`, `pip-sync`) and other tools import `pip._vendor.pkg_resources`, so a repository's baseline would fail in this image and pass in the stock one; pip's own `vendor.txt` pins setuptools 70.3.0 for it, and the latest setuptools (84.0.0) no longer ships `pkg_resources` at all |
 | The exception | `verifier/images/python/pip-pkg-resources.openvex.json`: OpenVEX, `not_affected`, `vulnerable_code_not_present`, one statement, one CVE, one purl. The workflow's Trivy step passes every `verifier/images/<runtime>/*.openvex.json` with `--vex`; only the python image has one |
-| What pins its scope | `verifier/check-vex.sh`, which the publishing workflow runs before every scan, refuses any document that is not exactly this exception, and any document in another runtime's directory; `verifier_images_test.exs` holds the same rules (and fails if another OpenVEX document appears under `verifier/`) |
+| What pins its scope | `verifier/check-vex.sh`, which the publishing workflow runs before every scan, refuses any document that is not exactly this exception, and any document in another runtime's directory; `tests/test_check_vex.py` holds the same rules, and `tests/test_images.py` fails if another OpenVEX document appears under `verifier/` |
 
 Evidence (Trivy 0.58.1, the workflow's flags `--severity HIGH,CRITICAL --ignore-unfixed --exit-code 1`,
 the python image built from this tree, 2026-10-07):
@@ -328,7 +328,7 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
 
 1. Pin the commit. `git ls-remote https://github.com/pypa/pip "refs/tags/$V^{}"` prints the commit
    of release `$V`. Review it, then replace the `--pip-source` pair in the Dockerfile with
-   `--pip-source $V=<commit>`. `verifier_images_test.exs` accepts any single
+   `--pip-source $V=<commit>`. `tests/test_images.py` accepts any single
    `--pip-source <version>=<40 hex>`, so nothing else names the version. If the new pip already
    carries a `--min` floor, delete that floor from the Dockerfile.
 2. Regenerate `pip-vendored.lock` from that commit's `vendor.txt`, with each `--min` floor applied
@@ -363,7 +363,7 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
      awk '/^[A-Za-z]/ {skip = ($0 ~ /^pip==/)} NF && !/^#/ && !skip' tools.lock; } > /tmp/new.lock && mv /tmp/new.lock pip-fix-tools.lock
    ```
 
-Then run `mix test` on `verifier_images_test.exs` and `verifier_image_fix_pip_test.exs`, `verifier/test/contract.sh
+Then run `python3 -I -m unittest discover -s tests`, `verifier/test/contract.sh
 python`, and the Trivy step as the workflow runs it. Both commands above were run against the pinned
 pip 26.2.1 and reproduce the committed bodies of `pip-vendored.lock` and `pip-fix-tools.lock` byte for
 byte. The node image needs no such procedure: a new floor is one `--min NAME@VERSION=sha512-...` line,

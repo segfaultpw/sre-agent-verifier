@@ -1,0 +1,56 @@
+version: 2
+updates:
+  # The runtime images (verifier/images/<runtime>: elixir, node, python, go, java, php).
+  # Each pins its base by digest, so a base that gets a security fix is only ever picked
+  # up when somebody changes the digest; this is that somebody, weekly, as one reviewed
+  # pull request. The weekly rebuild (.github/workflows/verifier-images.yml) re-resolves
+  # the digests itself in the meantime, so a fix is not held back by a pull request
+  # waiting for review.
+  - package-ecosystem: docker
+    directories:
+      - "/verifier/images/*"
+    schedule:
+      interval: weekly
+      day: sunday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      verifier-images:
+        patterns:
+          - "*"
+    ignore:
+      # The Elixir image carries the same Elixir and Erlang the platform builds with, so
+      # only patch and digest updates come through here.
+      - dependency-name: hexpm/elixir
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      # Odd Node majors are never long-term support and drop tooling the image relies on
+      # (Node 25 removed corepack, which the node image enables), so only the even, LTS
+      # lines are proposed.
+      - dependency-name: node
+        versions:
+          - ">= 25, < 26"
+          - ">= 27, < 28"
+          - ">= 29, < 30"
+          - ">= 31, < 32"
+      # The JDK image follows the long-term support releases (21, 25, 29, 33), never the
+      # six-month ones in between.
+      - dependency-name: maven
+        versions:
+          - ">= 22, < 25"
+          - ">= 26, < 29"
+          - ">= 30, < 33"
+          - ">= 34, < 37"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: sunday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: build
+      include: scope

@@ -37,6 +37,8 @@ when one is retired, which one to move to.
 
 The full contract is [`verifier/contract.md`](verifier/contract.md), and the runner is
 [`verifier/run.sh`](verifier/run.sh).
+The platform side keeps a pinned copy of both files and checks it against this repository, so a
+change to the contract is deliberate on both sides.
 
 ## How the images are built
 
@@ -53,7 +55,30 @@ Use the `verifier` module of
 small poller in your account that asks SRE Agent for work over an outbound HTTPS request
 and starts these images. SRE Agent never connects to your account.
 
+## Tests
+
+The tests use the Python standard library only:
+
+```bash
+python3 -I -m unittest discover -s tests -v
+```
+
+They cover the image sources (every base pinned by digest, the pinned inputs of the node and
+python images, the scanner exception), the scripts the Dockerfiles run, and this repository's
+workflow. They need `bash`, `git`, `jq`, `openssl` and `tar`; set
+`VERIFIER_TESTS_REQUIRE_TOOLS=1` to fail instead of skip when one is missing. The publishing
+workflow runs them first, and nothing is built or published when one fails.
+`verifier/test/contract.sh RUNTIME` runs the runner contract inside a real image and needs Docker.
+
+## Dependency updates
+
+Dependabot (`.github/dependabot.yml`) proposes new base digests for `verifier/images/*` and
+new versions of the GitHub Actions the workflow uses, weekly. The Go image is pinned to a
+Go patch release, Node stays on its even (long-term support) lines and the JDK on its
+long-term support releases. The weekly rebuild also re-resolves every base digest itself.
+
 ## Contributing
 
-This repository is published from SRE Agent's source. Issues are welcome; changes are made
-upstream and appear here.
+This repository is the source of the images and the runner. Issues and pull requests are
+welcome. A change to `verifier/run.sh` or `verifier/contract.md` changes what the platform
+runs against, so it is made together with the platform's pinned copy.

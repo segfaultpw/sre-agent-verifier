@@ -12,7 +12,7 @@
 # vulnerable_code_not_present, and no other field. A runtime with no allowed exception
 # refuses any document. No document at all is fine.
 #
-# The rules are the ones verifier_images_test.exs pins, and the two are kept equal on purpose.
+# tests/test_check_vex.py pins these rules, and the committed document is one of its cases.
 
 set -euo pipefail
 
