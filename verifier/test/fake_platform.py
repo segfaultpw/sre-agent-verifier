@@ -17,11 +17,15 @@ As a scenario, for session mode: `fake_platform.py --scenario FILE --port PORT -
                      "delay_ms"; when the list is used up the answer is `exhausted_status`
   exhausted_status   default 410
   ready_answer       the object answered to `PUT .../ready` (default {})
+  setup_done_answer  the object answered to `PUT .../setup_done` (default {})
   result_statuses    {"<seq>": 410} to refuse a job result
+  credentials        proxy credentials the platform lists as live: {"user", "password", "kind",
+                     "from": "start" | "ready" | "setup_done", "until": "never" | "ready" |
+                     "setup_done"}; `POST /authorize` answers whether a credential is live now
 
 Every request is recorded (method, path, query, time) in `events` and, with a log file, as a
-JSON line. Bodies of `PUT`s are stored in the results directory: ready.json, result.json and
-result-<seq>.json.
+JSON line. Bodies of `PUT`s are stored in the results directory: ready.json, setup_done.json,
+result.json and result-<seq>.json.
 """
 import http.server
 import json
@@ -60,6 +64,7 @@ class Platform:
         self.lock = threading.Lock()
         self.claimed = False
         self.ready_done = False
+        self.setup_done_done = False
         self.bodies = {}
         self.script = list(self.scenario.get("next", []))
         self._server = _Server(("127.0.0.1", port), self._handler())
@@ -114,6 +119,22 @@ class Platform:
     def has(self, name):
         with self.lock:
             return name in self.bodies
+
+    def is_live(self, credential):
+        started = {"start": True, "ready": self.ready_done, "setup_done": self.setup_done_done}
+        ended = {"never": False, "ready": self.ready_done, "setup_done": self.setup_done_done}
+        return started[credential.get("from", "start")] and not ended[credential.get("until", "never")]
+
+    def authorize(self, request):
+        with self.lock:
+            for credential in self.scenario.get("credentials", []):
+                if (
+                    credential["user"] == request.get("user")
+                    and credential["password"] == request.get("password")
+                    and self.is_live(credential)
+                ):
+                    return {"allow": True, "kind": credential["kind"]}
+        return {"allow": False}
 
     def _handler(self):
         platform = self
@@ -186,6 +207,11 @@ class Platform:
                     with platform.lock:
                         platform.ready_done = True
                     self._json(200, platform.scenario.get("ready_answer", {}))
+                elif path.endswith("/setup_done"):
+                    platform.store("setup_done.json", body)
+                    with platform.lock:
+                        platform.setup_done_done = True
+                    self._json(200, platform.scenario.get("setup_done_answer", {}))
                 elif match:
                     seq = match.group(1)
                     status = platform.scenario.get("result_statuses", {}).get(seq, 200)
@@ -195,6 +221,14 @@ class Platform:
                 elif path.endswith("/result"):
                     platform.store("result.json", body)
                     self._json(200, {"status": "recorded"})
+                else:
+                    self._send(404)
+
+            def do_POST(self):
+                body = self._body()
+                parts = urllib.parse.urlsplit(self.path)
+                if parts.path == "/authorize":
+                    self._json(200, platform.authorize(json.loads(body or b"{}")))
                 else:
                     self._send(404)
 

@@ -18,6 +18,7 @@ from support import VERIFIER, TempDirCase, missing_tools, requires_tools
 
 sys.path.insert(0, str(VERIFIER / "test"))
 from fake_platform import Platform  # noqa: E402
+from fake_proxy import Proxy  # noqa: E402
 
 RUNNER = VERIFIER / "run.sh"
 TOOLS = ("bash", "jq", "curl", "git", "setsid", "mkfifo", "realpath", "base64")
@@ -80,6 +81,96 @@ def iso(epoch):
     return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class AllowedService:
+    """The 'allowlisted host': answers `allowed-ok` to anything."""
+
+    def __init__(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"allowed-ok"
+                self.send_response(200)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+class GitHttpServer:
+    """git over HTTP for one directory of bare repositories, through `git http-backend`."""
+
+    def __init__(self, root):
+        env_root = str(root)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _serve(self):
+                parts = urllib.parse.urlsplit(self.path)
+                length = int(self.headers.get("content-length", "0"))
+                body = self.rfile.read(length) if length else b""
+                env = {
+                    "PATH": os.environ["PATH"],
+                    "GIT_PROJECT_ROOT": env_root,
+                    "GIT_HTTP_EXPORT_ALL": "1",
+                    "PATH_INFO": parts.path,
+                    "QUERY_STRING": parts.query,
+                    "REQUEST_METHOD": self.command,
+                    "CONTENT_TYPE": self.headers.get("content-type", ""),
+                    "CONTENT_LENGTH": str(len(body)),
+                    "REMOTE_ADDR": "127.0.0.1",
+                    **GIT_ENV,
+                }
+                done = subprocess.run(["git", "http-backend"], input=body, env=env, capture_output=True)
+                head, _, payload = done.stdout.partition(b"\r\n\r\n")
+                status, headers = 200, []
+                for line in head.decode("latin-1").split("\r\n"):
+                    key, _, value = line.partition(":")
+                    if key.lower() == "status":
+                        status = int(value.strip().split()[0])
+                    elif key:
+                        headers.append((key, value.strip()))
+                self.send_response(status)
+                for key, value in headers:
+                    self.send_header(key, value)
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = do_POST = _serve
+
+            def log_message(self, *_args):
+                pass
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        self._server = Server(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def have_git_http_backend():
+    if shutil.which("git") is None:
+        return False
+    exec_path = subprocess.run(["git", "--exec-path"], capture_output=True, text=True).stdout.strip()
+    return os.path.exists(os.path.join(exec_path, "git-http-backend"))
+
+
 class SessionCase(TempDirCase):
     """One fixture repository, a results directory and a way to start the runner."""
 
@@ -118,6 +209,16 @@ class SessionCase(TempDirCase):
         platform = Platform(scenario, results_dir=str(self.results), log_path=str(self.events_log)).start()
         self.servers.append(platform)
         return platform
+
+    def proxy(self, platform, hosts, mapping=None):
+        proxy = Proxy(platform.url("/authorize"), hosts, mapping or {}).start()
+        self.servers.append(proxy)
+        return proxy
+
+    def allowed_service(self):
+        service = AllowedService()
+        self.servers.append(service)
+        return service
 
     def session_scenario(self, steps, jobs, **extra):
         session = {

@@ -39,8 +39,19 @@ ALLOW_UNPRIVILEGED=${VERIFIER_ALLOW_UNPRIVILEGED:-0}
 SANDBOX_USER=${VERIFIER_SANDBOX_USER:-sandbox}
 
 # Proxy settings come from the task definition, not from the platform's response.
-# They are forwarded to the steps (package managers need them).
+# They are forwarded to the steps (package managers need them), except on the hosted
+# verifier, where VERIFIER_PROXY_URL names the egress proxy (host and port) and the
+# credentials that decide what a command may reach come from the bootstrap.
 PROXY_VARS=(HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy)
+PROXY_ENDPOINT=""
+if [ -n "${VERIFIER_PROXY_URL:-}" ]; then
+  PROXY_ENDPOINT=${VERIFIER_PROXY_URL#http://}
+  PROXY_ENDPOINT=${PROXY_ENDPOINT%/}
+  if ! [[ "$PROXY_ENDPOINT" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then
+    printf '[verifier] VERIFIER_PROXY_URL is not a host and port\n' >&2
+    exit 2
+  fi
+fi
 RUNNER_VERSION=3
 
 EXCERPT_FLOOR=400
@@ -100,28 +111,105 @@ else
   fi
 fi
 
-STEP_ENV=("PATH=$PATH" "HOME=$SANDBOX_HOME" "LANG=C.UTF-8" "CI=true" "TERM=dumb" "GIT_TERMINAL_PROMPT=0")
+BASE_ENV=("PATH=$PATH" "HOME=$SANDBOX_HOME" "LANG=C.UTF-8" "CI=true" "TERM=dumb" "GIT_TERMINAL_PROMPT=0")
+TASK_PROXY_ENV=()
 for name in "${PROXY_VARS[@]}"; do
-  if [ -n "${!name:-}" ]; then STEP_ENV+=("$name=${!name}"); fi
+  if [ -n "${!name:-}" ]; then TASK_PROXY_ENV+=("$name=${!name}"); fi
 done
+IMAGE_ENV=()
 if [ -r "$STEP_ENV_FILE" ]; then
   while IFS= read -r line; do
     case "$line" in
       '' | '#'*) ;;
-      [A-Za-z_]*=*) STEP_ENV+=("$line") ;;
+      [A-Za-z_]*=*) IMAGE_ENV+=("$line") ;;
     esac
   done <"$STEP_ENV_FILE"
 fi
 
-# The prefix every command of the repository runs under: the unprivileged user, no
-# way to gain privileges, an empty capability set, and an environment rebuilt from
-# the whitelist above. Anything not on it does not exist for the command.
-if [ -n "$SANDBOX_UID" ]; then
-  SANDBOX_PREFIX=(setpriv --reuid="$SANDBOX_UID" --regid="$SANDBOX_GID" --clear-groups
-    --no-new-privs --bounding-set=-all --inh-caps=-all -- env -i "${STEP_ENV[@]}")
-else
-  SANDBOX_PREFIX=(env -i "${STEP_ENV[@]}")
-fi
+# What the commands may reach is decided per phase, by what they are handed:
+#   setup     the install phase: the proxy settings of the task definition, or on the hosted
+#             verifier the `setup` credential, which the platform revokes before any job;
+#   baseline  a session's tests on the unmodified tree, before the ready report;
+#   checks    everything after setup: nothing, unless the repository's setting allows it
+#             (the bootstrap's "network" key) and, on the hosted verifier, the platform
+#             handed over a `checks` credential.
+# PROXY_USER, SETUP_CRED, CHECKS_CRED and NETWORK are filled in as the bootstrap and the
+# platform's answers arrive. NETWORK is true, false, or legacy for a version 2 platform's
+# run bootstrap, which has no such key and keeps the task definition's proxy everywhere.
+STEP_PROXY_ENV=()
+PROXY_USER=""
+RUNNER_CRED=""
+SETUP_CRED=""
+CHECKS_CRED=""
+NETWORK=legacy
+RUNNER_PROXY_URL=""
+
+# uri_encode STRING: percent-encodes everything but the unreserved characters, in the
+# shell itself, because a credential must never be handed to another program as an
+# argument. The result is in REPLY.
+uri_encode() {
+  local LC_ALL=C text=$1 out="" char hex i
+  for ((i = 0; i < ${#text}; i++)); do
+    char=${text:i:1}
+    case "$char" in
+      [A-Za-z0-9._~-]) out+=$char ;;
+      *)
+        printf -v hex '%%%02X' "'$char"
+        out+=$hex
+        ;;
+    esac
+  done
+  REPLY=$out
+}
+
+# proxy_url USER SECRET: the hosted proxy's URL with the credential in it, in REPLY.
+proxy_url() {
+  local user secret
+  uri_encode "$1"
+  user=$REPLY
+  uri_encode "$2"
+  secret=$REPLY
+  REPLY="http://$user:$secret@$PROXY_ENDPOINT"
+}
+
+# use_step_env PHASE: rebuilds the environment and the prefix every command of the
+# repository runs under: the unprivileged user, no way to gain privileges, an empty
+# capability set, and an environment rebuilt from a whitelist. Anything not on it does not
+# exist for the command.
+use_step_env() {
+  local phase=$1 mode=none secret="" proxy_env=() url
+  if [ -n "$PROXY_ENDPOINT" ] && [ -n "$PROXY_USER" ]; then
+    case "$phase" in
+      setup) if [ -n "$SETUP_CRED" ]; then mode=hosted secret=$SETUP_CRED; fi ;;
+      baseline) if [ "$NETWORK" = true ] && [ -n "$SETUP_CRED" ]; then mode=hosted secret=$SETUP_CRED; fi ;;
+      checks) if [ -n "$CHECKS_CRED" ]; then mode=hosted secret=$CHECKS_CRED; fi ;;
+    esac
+  else
+    case "$phase" in
+      setup) mode=task ;;
+      baseline | checks) if [ "$NETWORK" = true ] || [ "$NETWORK" = legacy ]; then mode=task; fi ;;
+    esac
+  fi
+  case "$mode" in
+    task) proxy_env=("${TASK_PROXY_ENV[@]}") ;;
+    hosted)
+      proxy_url "$PROXY_USER" "$secret"
+      url=$REPLY
+      # Loopback is never proxied: a repository's tests talk to services they start.
+      proxy_env=("HTTP_PROXY=$url" "HTTPS_PROXY=$url" "http_proxy=$url" "https_proxy=$url"
+        "NO_PROXY=localhost,127.0.0.1,::1" "no_proxy=localhost,127.0.0.1,::1")
+      ;;
+  esac
+  STEP_ENV=("${BASE_ENV[@]}" "${IMAGE_ENV[@]}")
+  STEP_PROXY_ENV=("${proxy_env[@]}")
+  if [ -n "$SANDBOX_UID" ]; then
+    SANDBOX_PREFIX=(setpriv --reuid="$SANDBOX_UID" --regid="$SANDBOX_GID" --clear-groups
+      --no-new-privs --bounding-set=-all --inh-caps=-all -- env -i "${STEP_ENV[@]}")
+  else
+    SANDBOX_PREFIX=(env -i "${STEP_ENV[@]}")
+  fi
+}
+use_step_env setup
 
 # The runner's own operations on the tree (a git command, a file write). A smaller
 # environment than a step's, and none of what lets git read configuration the
@@ -284,7 +372,11 @@ run_step() {
 
   # A new session, so one kill to the negative PID reaches the whole group. A background job is not
   # a process group leader, so setsid does not fork and PID is the step's own.
-  (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" bash -c "$cmd" </dev/null) >"$fifo" 2>&1 &
+  # The proxy settings of the command (they can hold a secret) reach it through a pipe on
+  # descriptor 3, which the command's own shell reads and closes before it runs anything,
+  # so they are on no command line, in no file and in no environment but the command's.
+  (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" bash -c 'while IFS= read -r -d "" kv <&3; do [ -n "$kv" ] && export "$kv"; done; exec 3<&-; exec bash -c "$1"' sh "$cmd" \
+    </dev/null 3< <(printf '%s\0' "${STEP_PROXY_ENV[@]}")) >"$fifo" 2>&1 &
   pid=$!
 
   while kill -0 "$pid" 2>/dev/null; do
@@ -415,7 +507,7 @@ fail_run() {
 
 # ---------------------------------------------------------------------------
 # The URLs. Each goes to curl through a file only root can open, so it is on no command
-# line.
+# line; on the hosted verifier the file also names the proxy and the runner's credential.
 # ---------------------------------------------------------------------------
 curl_config() {
   # curl_config FILE URL: a config file holding one URL, readable by root only.
@@ -426,7 +518,13 @@ curl_config() {
       return 1
       ;;
   esac
-  (umask 077 && printf 'url = "%s"\n' "$url" >"$file")
+  (
+    umask 077
+    {
+      printf 'url = "%s"\n' "$url"
+      if [ -n "$RUNNER_PROXY_URL" ]; then printf 'proxy = "%s"\n' "$RUNNER_PROXY_URL"; fi
+    } >"$file"
+  )
 }
 
 # with_query URL PARAM: the URL with one more query parameter, in REPLY.
@@ -442,6 +540,48 @@ json_string() {
   REPLY=$(jq -r "($2) | if type == \"string\" then . else \"\" end" "$1" 2>/dev/null) || REPLY=""
 }
 
+# The hosted verifier's credentials, from the bootstrap: the user (`run:<id>` or
+# `session:<id>`), the runner's own and the one for setup commands. Without all three the
+# bootstrap is treated as one from a platform that has no proxy credentials.
+read_proxy_credentials() {
+  [ -n "$PROXY_ENDPOINT" ] || return 0
+  json_string "$1" '.proxy.user'
+  PROXY_USER=$REPLY
+  json_string "$1" '.proxy.runner'
+  RUNNER_CRED=$REPLY
+  json_string "$1" '.proxy.setup'
+  SETUP_CRED=$REPLY
+  if [ -n "$PROXY_USER" ] && [ -n "$RUNNER_CRED" ] && [ -n "$SETUP_CRED" ]; then
+    proxy_url "$PROXY_USER" "$RUNNER_CRED"
+    RUNNER_PROXY_URL=$REPLY
+  else
+    PROXY_USER="" RUNNER_CRED="" SETUP_CRED="" RUNNER_PROXY_URL=""
+  fi
+  use_step_env setup
+}
+
+# The `checks` credential, when the platform's answer (the ready report's or setup done's)
+# carries one.
+read_checks_credential() {
+  json_string "$1" '.proxy.checks'
+  CHECKS_CRED=$REPLY
+}
+
+# A run on the hosted verifier tells the platform when setup is over; the platform
+# revokes the `setup` credential and answers with the `checks` credential only when the
+# repository's setting allows commands after setup to reach the network.
+SETUP_DONE_URL=""
+setup_done() {
+  [ -n "$SETUP_DONE_URL" ] || return 0
+  if ! curl_config "$OUT/setup-done.curl" "$SETUP_DONE_URL"; then return 0; fi
+  printf '{}' >"$OUT/setup-done.body"
+  if put_json "$OUT/setup-done.curl" "$OUT/setup-done.body"; then
+    read_checks_credential "$OUT/response.txt"
+  else
+    log "setup done was not accepted ($PUT_CODE); commands after setup get no network"
+  fi
+}
+
 BOOTSTRAP_CONFIG="$OUT/bootstrap.curl"
 RESULT_CONFIG="$OUT/result.curl"
 READY_CONFIG="$OUT/ready.curl"
@@ -454,7 +594,7 @@ JOB_FILE="$OUT/job.json"
 # Clone at the base commit into a root-owned staging directory nobody else can
 # reach. The token is used for this one command, through git's own environment
 # configuration, so it is written to no file and no git config and is on no command
-# line. Once the tree is complete it is handed to the
+# line (nor is the proxy credential). Once the tree is complete it is handed to the
 # unprivileged user and moved into place with one rename: root never writes inside a
 # directory that user can write. The fetch is held to the clock.
 # ---------------------------------------------------------------------------
@@ -475,6 +615,12 @@ do_clone() {
       export "GIT_CONFIG_KEY_$n=http.extraheader" "GIT_CONFIG_VALUE_$n=Authorization: Basic $auth"
       n=$((n + 1))
     fi
+    if [ -n "$RUNNER_PROXY_URL" ]; then
+      export "GIT_CONFIG_KEY_$n=http.proxy" "GIT_CONFIG_VALUE_$n=$RUNNER_PROXY_URL"
+      n=$((n + 1))
+      export "GIT_CONFIG_KEY_$n=http.proxyAuthMethod" "GIT_CONFIG_VALUE_$n=basic"
+      n=$((n + 1))
+    fi
     export GIT_CONFIG_COUNT=$n
     timeout -k 5 "$remaining" git fetch -q --depth 1 --no-tags origin "${BASE_SHA:-HEAD}" || exit 1
     unset GIT_CONFIG_COUNT auth
@@ -488,6 +634,7 @@ do_clone() {
       clone_text=$(tail -c 1500 "$OUT/clone.log" | tr -d '\000')
     fi
     if [ -n "$REPO_TOKEN" ]; then clone_text=${clone_text//"$REPO_TOKEN"/[token]}; fi
+    if [ -n "$RUNNER_CRED" ]; then clone_text=${clone_text//"$RUNNER_CRED"/[credential]}; fi
     record clone error $(($(now_ms) - clone_started)) "$clone_text"
     unset REPO_TOKEN
     return 1
@@ -902,6 +1049,7 @@ session_main() {
     log "the session bootstrap names no ready URL; nothing can be reported"
     exit 1
   fi
+  read_proxy_credentials "$BOOTSTRAP_FILE"
   if ! curl_config "$READY_CONFIG" "$ready_url"; then exit 1; fi
   log "session mode"
 
@@ -920,6 +1068,7 @@ session_main() {
   REPO_TOKEN=$(jq -r '.repo_token // ""' "$BOOTSTRAP_FILE")
   BASE_SHA=$(jq -r '.base_sha // ""' "$BOOTSTRAP_FILE")
   MAX_OUTPUT_BYTES=$(jq -r '.max_output_bytes // 1000000' "$BOOTSTRAP_FILE")
+  NETWORK=$(jq -r 'if .network == true then "true" else "false" end' "$BOOTSTRAP_FILE")
   STEPS_JSON=$(jq -c .steps "$BOOTSTRAP_FILE")
   RULES_JSON=$(jq -c 'if (.analysis | type) == "object" then (.analysis.files // {}) elif .analysis == null then {} else "invalid" end' "$BOOTSTRAP_FILE")
   printf '%s' "$STEPS_JSON" >"$OUT/snapshot.json"
@@ -941,6 +1090,7 @@ session_main() {
   snapshot_git_state
   write_rules
 
+  use_step_env setup
   SETUP_OK=true
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
@@ -957,6 +1107,7 @@ session_main() {
 
   # Every test command, each reported on its own: a red one does not end the session, the
   # platform shows it as "red on the unmodified tree" next to the same command's result.
+  use_step_env baseline
   BASELINE_GREEN=true
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
@@ -969,6 +1120,8 @@ session_main() {
     log "the ready report was not accepted ($PUT_CODE)"
     case "$PUT_CODE" in 409 | 410) exit 0 ;; *) exit 1 ;; esac
   fi
+  read_checks_credential "$OUT/response.txt"
+  use_step_env checks
   : >"$STEPS_FILE"
   session_loop
 }
@@ -980,6 +1133,20 @@ session_main() {
 # platform which runner this is, so a session is only ever given to one that knows
 # what a session is.
 # ---------------------------------------------------------------------------
+if [ -n "$PROXY_ENDPOINT" ]; then
+  # Until the bootstrap is claimed the only credential is the URL's own signature, good
+  # for the platform host and nothing else.
+  BOOTSTRAP_RE='/verifier/(sessions/)?([^/?#]+)/([^/?#]+)/bootstrap([?#].*)?$'
+  if [[ "$BOOTSTRAP_URL" =~ $BOOTSTRAP_RE ]]; then
+    pre_kind=run
+    if [ -n "${BASH_REMATCH[1]}" ]; then pre_kind=session; fi
+    proxy_url "$pre_kind:${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    RUNNER_PROXY_URL=$REPLY
+  else
+    log "the bootstrap URL names no run or session, so the proxy cannot be authenticated to"
+    exit 1
+  fi
+fi
 with_query "$BOOTSTRAP_URL" "runner=$RUNNER_VERSION"
 if ! curl_config "$BOOTSTRAP_CONFIG" "$REPLY"; then exit 1; fi
 unset BOOTSTRAP_URL
@@ -994,6 +1161,9 @@ for attempt in 1 2 3; do
   esac
 done
 chmod 0600 "$BOOTSTRAP_FILE" 2>/dev/null
+# The signature is worth nothing once the bootstrap is claimed, and is not kept.
+rm -f "$BOOTSTRAP_CONFIG"
+RUNNER_PROXY_URL=""
 
 # Without the bootstrap there is no result URL, so nothing can be reported: the
 # platform ends the run at its deadline.
@@ -1015,6 +1185,7 @@ if ! jq -e '(.repo_url | type == "string") and (.result_url | type == "string") 
   exit 1
 fi
 
+read_proxy_credentials "$BOOTSTRAP_FILE"
 if ! curl_config "$RESULT_CONFIG" "$(jq -r .result_url "$BOOTSTRAP_FILE")"; then exit 1; fi
 REPO_URL=$(jq -r .repo_url "$BOOTSTRAP_FILE")
 REPO_TOKEN=$(jq -r '.repo_token // ""' "$BOOTSTRAP_FILE")
@@ -1025,6 +1196,9 @@ STEPS_JSON=$(jq -c .steps "$BOOTSTRAP_FILE")
 # The platform's static analysis rules, file name to text, when the run has an analysis
 # command. Anything that is not an object stays a string, which the check below refuses.
 RULES_JSON=$(jq -c 'if (.analysis | type) == "object" then (.analysis.files // {}) elif .analysis == null then {} else "invalid" end' "$BOOTSTRAP_FILE")
+NETWORK=$(jq -r 'if has("network") then (if .network == true then "true" else "false" end) else "legacy" end' "$BOOTSTRAP_FILE")
+json_string "$BOOTSTRAP_FILE" '.setup_done_url'
+SETUP_DONE_URL=$REPLY
 jq -c '{files: .files}' "$BOOTSTRAP_FILE" >"$PATCH_FILE"
 # The token has been read; the response that carried it is not kept.
 rm -f "$BOOTSTRAP_FILE"
@@ -1058,6 +1232,7 @@ fi
 write_rules
 
 # setup: once, before anything is judged.
+use_step_env setup
 SETUP_OK=true
 while IFS= read -r entry; do
   [ -n "$entry" ] || continue
@@ -1070,6 +1245,11 @@ if [ "$SETUP_OK" != true ]; then
   BASELINE_GREEN=false
   finish
 fi
+
+# Setup is over: the platform revokes the setup credential, and hands over the one for the
+# commands after it only when the repository's setting allows them the network.
+setup_done
+use_step_env checks
 
 # baseline: the repository's own tests on the unmodified tree, reported as ONE
 # step however many commands there are (the platform accepts 20 steps). The first
