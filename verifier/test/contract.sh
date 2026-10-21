@@ -32,9 +32,9 @@
 #     (a scanner running as root for the whole run looks) or in a command's environment;
 #   * the network rule, through a local proxy that admits only the secrets the platform
 #     lists as live: a job command that opens a connection to an allowed host fails after
-#     the ready report when the session says off and succeeds when on, the secret a setup
-#     command saved is refused after the ready report, and no secret is in a job command's
-#     environment.
+#     setup when the session says off and succeeds when on, the secret a setup command saved
+#     is refused once setup is done (for the baseline, which runs right after setup, as
+#     for every later command), and no secret is in a job command's environment.
 #
 # The go image also has a toolchain floor: Go 1.26.9 or later (the release that fixes the
 # standard library advisories the scan reported), checked with `go version` in the image.
@@ -276,6 +276,9 @@ network_cases() {
     tunnel="curl -sS -f --max-time 10 --proxytunnel http://allowed.test:$aport/ | grep -q allowed-ok"
     saved="printf %s \"\$HTTPS_PROXY\" >\"\$HOME/cred\" && $reach"
     dead="test -s \"\$HOME/cred\" && ! http_proxy=\"\$(cat \"\$HOME/cred\")\" curl -sS -f --max-time 10 http://allowed.test:$aport/"
+    # A baseline command (a `test`) runs right after setup, before the ready report: the secret the
+    # setup command saved must already be dead for it.
+    stolen="$dead"
     # The platform's address is built here and handed to curl on its standard input, so it is on no
     # command line either.
     platform_probe="h=127.0.0; ! printf 'url = \"http://%s.1:%s/%s/s1/next\"\\n' \"\$h\" $port sessions | curl -sS -f --max-time 10 --noproxy x.invalid -K -"
@@ -288,7 +291,7 @@ network_cases() {
     fi
 
     jq -n --arg end "$end" --arg sha "$sha" --arg saved "$saved" --arg reach "$reach" --arg tunnel "$tunnel" \
-      --arg dead "$dead" --arg env_probe "$env_probe" --arg platform "$platform_probe" \
+      --arg dead "$dead" --arg stolen "$stolen" --arg env_probe "$env_probe" --arg platform "$platform_probe" \
       --argjson on "$checks_on" "$jq_defs"'
       [step(0; "save"; "setup"; $saved),
        step(1; "tests"; "test"; "sh test_old.sh"),
@@ -296,22 +299,25 @@ network_cases() {
        step(3; "tunnel"; "check"; $tunnel),
        step(4; "dead"; "check"; $dead),
        step(5; "env_probe"; "check"; $env_probe),
-       step(6; "platform"; "check"; $platform)] as $steps
+       step(6; "platform"; "check"; $platform),
+       step(7; "stolen"; "test"; $stolen)] as $steps
       | {bootstrap: session($end; $sha; $steps;
-           {bootstrap: {network: $on,
+           {session: {setup_done_url: "http://127.0.0.1:@PORT@/sessions/s1/setup_done"},
+            bootstrap: {network: $on,
                         proxy: {user: "session:s1", runner: "RUNNERCRED", setup: "SETUPCRED"}}}),
          credentials: ([{user: "session:s1", password: "SIGSECRET", kind: "bootstrap"},
                         {user: "session:s1", password: "RUNNERCRED", kind: "runner"},
-                        {user: "session:s1", password: "SETUPCRED", kind: "setup", until: "ready"}]
-                       + (if $on then [{user: "session:s1", password: "CHECKSCRED", kind: "checks", from: "ready"}] else [] end)),
-         ready_answer: (if $on then {proxy: {checks: "CHECKSCRED"}} else {} end),
-         next: [{status: 200, job: job(1; (if $on then $steps[2:] else $steps[2:6] end); [])}]}' >"$scenario"
+                        {user: "session:s1", password: "SETUPCRED", kind: "setup", until: "setup_done"}]
+                       + (if $on then [{user: "session:s1", password: "CHECKSCRED", kind: "checks", from: "setup_done"}] else [] end)),
+         setup_done_answer: (if $on then {proxy: {checks: "CHECKSCRED"}} else {} end),
+         next: [{status: 200, job: job(1; (if $on then $steps[2:7] else $steps[2:6] end); [])}]}' >"$scenario"
     run_session "$tag" "$tmp" "$port" "$scenario" "$results" -e "VERIFIER_PROXY_URL=http://127.0.0.1:$pport"
     kill "$proxy_pid" "$allowed_pid" 2>/dev/null || true
     proxy_pid=""
     allowed_pid=""
 
-    expect_all_pass "$results/ready.json" "the boot with the network $network (the setup secret reaches the allowed host)"
+    expect_all_pass "$results/ready.json" "the boot with the network $network (the setup secret reaches the allowed host, and is dead for the baseline)"
+    expect_status "$results/ready.json" baseline pass "the baseline, the setup secret saved by a setup command being dead for it, network $network"
     expect_status "$results/result-1.json" dead pass "the setup secret saved by a setup command, network $network"
     expect_status "$results/result-1.json" env_probe pass "the job environment, network $network"
     if [ "$network" = on ]; then
@@ -331,7 +337,7 @@ network_cases() {
       fi
     fi
     jq -e -s '[.[] | select(.kind == "setup" and .allowed == true)] | length >= 1' "$results/proxy.jsonl" >/dev/null || fail "the setup secret never reached the allowed host"
-    jq -e -s '[.[] | select(.allowed == false and .host == ("allowed.test:'"$aport"'"))] | length >= 1' "$results/proxy.jsonl" >/dev/null || fail "the saved setup secret was not refused after the ready report"
+    jq -e -s '[.[] | select(.allowed == false and .host == ("allowed.test:'"$aport"'"))] | length >= 1' "$results/proxy.jsonl" >/dev/null || fail "the saved setup secret was not refused once setup was done"
     jq -e -s '[.[] | select(.kind == "bootstrap")] | length == 1' "$results/proxy.jsonl" >/dev/null || fail "the bootstrap did not go through the proxy on the URL's signature"
   done
 }

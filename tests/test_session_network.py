@@ -56,7 +56,7 @@ class NetworkCase(SessionCase):
         env = {"VERIFIER_PROXY_URL": proxy.url()}
         return platform, proxy, "allowed.test:%d" % allowed.port, env
 
-    def credentials(self, ready=False, user="session:s1", setup_until="ready", checks_from="ready"):
+    def credentials(self, ready=False, user="session:s1", setup_until="setup_done", checks_from="setup_done"):
         creds = [
             {"user": user, "password": SIGNATURE, "kind": "bootstrap"},
             {"user": user, "password": RUNNER_CRED, "kind": "runner"},
@@ -67,9 +67,11 @@ class NetworkCase(SessionCase):
         return creds
 
     def session(self, network, steps, jobs, checks=None, **extra):
-        """A hosted session scenario. `checks` defaults to `network`: whether the ready answer
-        carries the checks credential."""
+        """A hosted session scenario. `checks` defaults to `network`: whether the answer to setup
+        done carries the checks credential. The setup credential is live until setup done."""
         checks = network if checks is None else checks
+        session = {"setup_done_url": "http://127.0.0.1:@PORT@/sessions/s1/setup_done"}
+        session.update(extra.pop("session", {}))
 
         def build(_allowed):
             return self.session_scenario(
@@ -79,8 +81,9 @@ class NetworkCase(SessionCase):
                     "proxy": {"user": "session:s1", "runner": RUNNER_CRED, "setup": SETUP_CRED},
                     "network": network,
                 },
+                session=session,
                 credentials=self.credentials(ready=checks),
-                ready_answer={"proxy": {"checks": CHECKS_CRED}} if checks else {},
+                setup_done_answer={"proxy": {"checks": CHECKS_CRED}} if checks else {},
                 **extra,
             )
 
@@ -148,6 +151,84 @@ class SessionNetworkTest(NetworkCase):
 
     def test_saved_setup_credential_is_dead_after_ready_even_when_checks_may_reach_the_network(self):
         self._saved_setup_credential(network=True)
+
+    def _baseline_with_saved_setup_credential(self, network):
+        save = step(4, "save", "setup", 'printf %s "$HTTPS_PROXY" >"$HOME/cred" && ' + reach())
+        # A `test` command is a baseline command: it runs after setup and before the ready report.
+        stolen = step(
+            5,
+            "stolen",
+            "test",
+            'test -s "$HOME/cred" && ! curl -sS -f --max-time 10 -x "$(cat "$HOME/cred")" http://allowed.test:@ALLOWED@/',
+        )
+        platform, proxy, allowed, env = self.hosted(self.session(network, [save, UNIT, LINT, stolen], []))
+        done = self.run_runner(platform, extra=env)
+        self.assertRunnerOk(done)
+        ready = self.ready()
+        self.assertEqual(self.status_of(ready, "baseline", index=5), ["pass"], "the saved credential did not work")
+        self.assertTrue(ready["baseline_green"])
+        moment = platform.requests("PUT", "/setup_done")[0]["t"]
+        used = [e["t"] for e in proxy.seen(host=allowed, kind="setup", allowed=True)]
+        self.assertTrue(used and max(used) <= moment, "the setup credential worked during setup only")
+        self.assertTrue(proxy.seen(host=allowed, allowed=False), "and was refused when the baseline tried it")
+
+    def test_saved_setup_credential_is_dead_for_the_baseline(self):
+        self._baseline_with_saved_setup_credential(network=False)
+
+    def test_saved_setup_credential_is_dead_for_the_baseline_when_checks_may_reach_the_network(self):
+        self._baseline_with_saved_setup_credential(network=True)
+
+    def test_baseline_runs_under_the_checks_credential(self):
+        online = step(4, "online", "test", reach())
+        platform, proxy, allowed, env = self.hosted(self.session(True, [UNIT, LINT, online], []))
+        done = self.run_runner(platform, extra=env)
+        self.assertRunnerOk(done)
+        self.assertEqual(self.status_of(self.ready(), "baseline", index=4), ["pass"])
+        moment = platform.requests("PUT", "/setup_done")[0]["t"]
+        admitted = proxy.seen(host=allowed, kind="checks", allowed=True)
+        self.assertTrue(admitted and min(e["t"] for e in admitted) >= moment)
+        self.assertEqual([e for e in proxy.seen(host=allowed, kind="setup") if e["t"] > moment], [])
+
+    def test_baseline_gets_no_proxy_when_off(self):
+        probe = step(4, "bare", "test", 'test -z "$HTTP_PROXY$HTTPS_PROXY$http_proxy$https_proxy$NO_PROXY"')
+        platform, proxy, allowed, env = self.hosted(self.session(False, [UNIT, LINT, probe], []))
+        done = self.run_runner(platform, extra=env)
+        self.assertRunnerOk(done)
+        self.assertEqual(self.status_of(self.ready(), "baseline", index=4), ["pass"])
+
+    def test_setup_done_comes_after_setup_and_before_the_baseline(self):
+        marker = step(0, "mark", "setup", 'echo setup >"$HOME/order"')
+        late = step(4, "late", "test", 'echo baseline >>"$HOME/order"')
+        platform, proxy, allowed, env = self.hosted(self.session(False, [marker, UNIT, LINT, late], []))
+        done = self.run_runner(platform, extra=env)
+        self.assertRunnerOk(done)
+        self.assertEqual((self.work / "home" / "order").read_text(), "setup\nbaseline\n")
+        puts = [e["path"].rsplit("/", 1)[-1] for e in platform.requests("PUT")]
+        self.assertEqual(puts[:2], ["setup_done", "ready"])
+
+    def test_a_platform_that_does_not_take_setup_done_gets_no_further_command(self):
+        late = step(4, "late", "test", 'echo ran >"$HOME/ran"')
+        platform, proxy, allowed, env = self.hosted(
+            self.session(False, [UNIT, LINT, late], [job(1, [LINT])], setup_done_status=500)
+        )
+        done = self.run_runner(platform, extra=env)
+        self.assertRunnerOk(done)
+        ready = self.ready()
+        self.assertIn("end of setup", ready["runner_error"])
+        self.assertFalse(ready["baseline_green"])
+        self.assertEqual(self.status_of(ready, "baseline"), [])
+        self.assertFalse((self.work / "home" / "ran").exists())
+        self.assertEqual(platform.requests("GET", "/next"), [])
+
+    def test_hosted_session_without_setup_done_url_is_refused_before_anything_runs(self):
+        late = step(4, "late", "test", 'echo ran >"$HOME/ran"')
+        scenario = self.session(False, [UNIT, LINT, late], [], session={"setup_done_url": ""})
+        platform, proxy, allowed, env = self.hosted(scenario)
+        done = self.run_runner(platform, extra=env)
+        self.assertRunnerOk(done)
+        self.assertIn("setup_done_url", self.ready()["runner_error"])
+        self.assertEqual(self.status_of(self.ready(), "clone"), [])
+        self.assertFalse((self.work / "home" / "ran").exists())
 
     def test_no_credential_in_job_environment_when_off(self):
         env_probe = step(
@@ -320,6 +401,16 @@ class RunNetworkTest(NetworkCase):
         self.assertRunnerOk(done)
         self.assertAllPass(platform.body("result.json"))
         self.assertEqual(platform.requests("PUT", "/setup_done"), [])
+
+    def test_run_whose_setup_done_is_not_taken_runs_no_further_command(self):
+        build = self.run_scenario_for(answer=False, network=False)
+        platform, proxy, allowed, env = self.hosted(lambda allowed: {**build(allowed), "setup_done_status": 500})
+        done = self.run_runner(platform, path=RUN_PATH, extra=env)
+        self.assertRunnerOk(done)
+        result = platform.body("result.json")
+        self.assertIn("end of setup", result["runner_error"])
+        self.assertEqual(self.status_of(result, "baseline"), [])
+        self.assertEqual(self.status_of(result, "after"), [])
 
 
 @runner_tools

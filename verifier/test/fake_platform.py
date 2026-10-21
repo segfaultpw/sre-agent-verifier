@@ -18,7 +18,11 @@ As a scenario, for session mode: `fake_platform.py --scenario FILE --port PORT -
   exhausted_status   default 410
   ready_answer       the object answered to `PUT .../ready` (default {})
   setup_done_answer  the object answered to `PUT .../setup_done` (default {})
+  setup_done_status  the status of that answer (default 200; the end of setup is then not stored)
   result_statuses    {"<seq>": 410} to refuse a job result
+  lose_answer        names of PUTs whose first answer is lost after the body was stored: "ready",
+                     "setup_done" or "result-<seq>"; the connection is closed without a reply, and
+                     a repeat of the same PUT is refused with 409 (the one-time URL was used)
   credentials        proxy credentials the platform lists as live: {"user", "password", "kind",
                      "from": "start" | "ready" | "setup_done", "until": "never" | "ready" |
                      "setup_done"}; `POST /authorize` answers whether a credential is live now
@@ -65,6 +69,7 @@ class Platform:
         self.claimed = False
         self.ready_done = False
         self.setup_done_done = False
+        self.lost = set()
         self.bodies = {}
         self.script = list(self.scenario.get("next", []))
         self._server = _Server(("127.0.0.1", port), self._handler())
@@ -193,6 +198,20 @@ class Platform:
                 else:
                     self._send(404)
 
+            def _lost(self, name):
+                """True when this PUT's answer is to be lost: the first one is (the body was
+                stored), a repeat is refused as a second use of a one-time URL."""
+                if name not in platform.scenario.get("lose_answer", []):
+                    return False
+                with platform.lock:
+                    seen = name in platform.lost
+                    platform.lost.add(name)
+                if seen:
+                    self._json(409, {"error": "this URL has already been used"})
+                    return True
+                self.close_connection = True
+                return True
+
             def do_PUT(self):
                 body = self._body()
                 parts = self._note(body)
@@ -203,21 +222,32 @@ class Platform:
                         handle.write(body)
                     self._json(200, {"status": "recorded"})
                 elif path.endswith("/ready"):
-                    platform.store("ready.json", body)
-                    with platform.lock:
-                        platform.ready_done = True
-                    self._json(200, platform.scenario.get("ready_answer", {}))
+                    first = "ready" not in platform.lost
+                    if first:
+                        platform.store("ready.json", body)
+                        with platform.lock:
+                            platform.ready_done = True
+                    if not self._lost("ready"):
+                        self._json(200, platform.scenario.get("ready_answer", {}))
                 elif path.endswith("/setup_done"):
-                    platform.store("setup_done.json", body)
-                    with platform.lock:
-                        platform.setup_done_done = True
-                    self._json(200, platform.scenario.get("setup_done_answer", {}))
+                    status = platform.scenario.get("setup_done_status", 200)
+                    if status == 200 and "setup_done" not in platform.lost:
+                        platform.store("setup_done.json", body)
+                        with platform.lock:
+                            platform.setup_done_done = True
+                    if status != 200:
+                        self._json(status, {"status": "refused"})
+                    elif not self._lost("setup_done"):
+                        self._json(200, platform.scenario.get("setup_done_answer", {}))
                 elif match:
                     seq = match.group(1)
                     status = platform.scenario.get("result_statuses", {}).get(seq, 200)
-                    if status == 200:
+                    if status == 200 and "result-%s" % seq not in platform.lost:
                         platform.store("result-%s.json" % seq, body)
-                    self._json(status, {"status": "recorded" if status == 200 else "refused"})
+                    if status != 200:
+                        self._json(status, {"status": "refused"})
+                    elif not self._lost("result-%s" % seq):
+                        self._json(200, {"status": "recorded"})
                 elif path.endswith("/result"):
                     platform.store("result.json", body)
                     self._json(200, {"status": "recorded"})

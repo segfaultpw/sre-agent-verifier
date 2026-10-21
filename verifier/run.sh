@@ -128,11 +128,11 @@ fi
 
 # What the commands may reach is decided per phase, by what they are handed:
 #   setup     the install phase: the proxy settings of the task definition, or on the hosted
-#             verifier the `setup` credential, which the platform revokes before any job;
-#   baseline  a session's tests on the unmodified tree, before the ready report;
-#   checks    everything after setup: nothing, unless the repository's setting allows it
-#             (the bootstrap's "network" key) and, on the hosted verifier, the platform
-#             handed over a `checks` credential.
+#             verifier the `setup` credential, which the platform revokes the moment setup is
+#             over (setup_done_url), before the baseline or any other command;
+#   checks    everything after setup, a session's baseline included: nothing, unless the
+#             repository's setting allows it (the bootstrap's "network" key) and, on the hosted
+#             verifier, the platform answered setup done with a `checks` credential.
 # PROXY_USER, SETUP_CRED, CHECKS_CRED and NETWORK are filled in as the bootstrap and the
 # platform's answers arrive. NETWORK is true, false, or legacy for a version 2 platform's
 # run bootstrap, which has no such key and keeps the task definition's proxy everywhere.
@@ -181,13 +181,12 @@ use_step_env() {
   if [ -n "$PROXY_ENDPOINT" ] && [ -n "$PROXY_USER" ]; then
     case "$phase" in
       setup) if [ -n "$SETUP_CRED" ]; then mode=hosted secret=$SETUP_CRED; fi ;;
-      baseline) if [ "$NETWORK" = true ] && [ -n "$SETUP_CRED" ]; then mode=hosted secret=$SETUP_CRED; fi ;;
       checks) if [ -n "$CHECKS_CRED" ]; then mode=hosted secret=$CHECKS_CRED; fi ;;
     esac
   else
     case "$phase" in
       setup) mode=task ;;
-      baseline | checks) if [ "$NETWORK" = true ] || [ "$NETWORK" = legacy ]; then mode=task; fi ;;
+      checks) if [ "$NETWORK" = true ] || [ "$NETWORK" = legacy ]; then mode=task; fi ;;
     esac
   fi
   case "$mode" in
@@ -560,26 +559,29 @@ read_proxy_credentials() {
   use_step_env setup
 }
 
-# The `checks` credential, when the platform's answer (the ready report's or setup done's)
-# carries one.
+# The `checks` credential, when the platform's answer to setup done carries one.
 read_checks_credential() {
   json_string "$1" '.proxy.checks'
   CHECKS_CRED=$REPLY
 }
 
-# A run on the hosted verifier tells the platform when setup is over; the platform
-# revokes the `setup` credential and answers with the `checks` credential only when the
-# repository's setting allows commands after setup to reach the network.
+# A run or a session on the hosted verifier tells the platform when setup is over, before any
+# other command runs; the platform revokes the `setup` credential and answers with the `checks`
+# credential only when the repository's setting allows commands after setup to reach the
+# network. Answers 0 when there is nothing to tell or the platform accepted it, 1 when it did
+# not: the `setup` credential may then still be live (a setup command could have saved it), so
+# a caller must not run another command.
 SETUP_DONE_URL=""
 setup_done() {
   [ -n "$SETUP_DONE_URL" ] || return 0
-  if ! curl_config "$OUT/setup-done.curl" "$SETUP_DONE_URL"; then return 0; fi
+  if ! curl_config "$OUT/setup-done.curl" "$SETUP_DONE_URL"; then return 1; fi
   printf '{}' >"$OUT/setup-done.body"
   if put_json "$OUT/setup-done.curl" "$OUT/setup-done.body"; then
     read_checks_credential "$OUT/response.txt"
-  else
-    log "setup done was not accepted ($PUT_CODE); commands after setup get no network"
+    return 0
   fi
+  log "setup done was not accepted ($PUT_CODE)"
+  return 1
 }
 
 BOOTSTRAP_CONFIG="$OUT/bootstrap.curl"
@@ -1030,6 +1032,7 @@ SESSION_VALID='
   and ((.session.ready_url | type) == "string")
   and ((.session.next_url | type) == "string")
   and ((.session.end_at | type) == "string")
+  and ((.session.setup_done_url // "") | type == "string")
   and ([.session.idle_seconds, .session.job_seconds, .session.setup_seconds]
        | all(type == "number" and . >= 1 and . <= 7200 and . == floor))
   and ((.repo_url | type) == "string")
@@ -1069,6 +1072,12 @@ session_main() {
   BASE_SHA=$(jq -r '.base_sha // ""' "$BOOTSTRAP_FILE")
   MAX_OUTPUT_BYTES=$(jq -r '.max_output_bytes // 1000000' "$BOOTSTRAP_FILE")
   NETWORK=$(jq -r 'if .network == true then "true" else "false" end' "$BOOTSTRAP_FILE")
+  json_string "$BOOTSTRAP_FILE" '.session.setup_done_url'
+  SETUP_DONE_URL=$REPLY
+  if [ -n "$PROXY_USER" ] && [ -z "$SETUP_DONE_URL" ]; then
+    # Without the message the platform cannot revoke the `setup` credential before the baseline.
+    fail_ready "the session bootstrap carries proxy credentials and no setup_done_url"
+  fi
   STEPS_JSON=$(jq -c .steps "$BOOTSTRAP_FILE")
   RULES_JSON=$(jq -c 'if (.analysis | type) == "object" then (.analysis.files // {}) elif .analysis == null then {} else "invalid" end' "$BOOTSTRAP_FILE")
   printf '%s' "$STEPS_JSON" >"$OUT/snapshot.json"
@@ -1105,9 +1114,18 @@ session_main() {
     exit 0
   fi
 
+  # Setup is over. The platform revokes the `setup` credential here and answers with the
+  # `checks` credential only when the repository's setting allows commands after setup the
+  # network; the baseline below is such a command, so it runs under whatever that answer
+  # allows and never under the `setup` credential a setup command may have saved. A platform
+  # that did not take the message leaves that credential live: no further command runs.
+  if ! setup_done; then
+    fail_ready "the platform did not accept the end of setup, so no further command was run"
+  fi
+  use_step_env checks
+
   # Every test command, each reported on its own: a red one does not end the session, the
   # platform shows it as "red on the unmodified tree" next to the same command's result.
-  use_step_env baseline
   BASELINE_GREEN=true
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
@@ -1120,8 +1138,6 @@ session_main() {
     log "the ready report was not accepted ($PUT_CODE)"
     case "$PUT_CODE" in 409 | 410) exit 0 ;; *) exit 1 ;; esac
   fi
-  read_checks_credential "$OUT/response.txt"
-  use_step_env checks
   : >"$STEPS_FILE"
   session_loop
 }
@@ -1247,8 +1263,9 @@ if [ "$SETUP_OK" != true ]; then
 fi
 
 # Setup is over: the platform revokes the setup credential, and hands over the one for the
-# commands after it only when the repository's setting allows them the network.
-setup_done
+# commands after it only when the repository's setting allows them the network. A platform
+# that did not take the message leaves the setup credential live, so no command runs.
+if ! setup_done; then fail_run "the platform did not accept the end of setup, so no further command was run"; fi
 use_step_env checks
 
 # baseline: the repository's own tests on the unmodified tree, reported as ONE

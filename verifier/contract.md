@@ -238,8 +238,12 @@ half of enforcing it by what it hands each command, in three phases:
 | phase | commands | what they are given |
 | --- | --- | --- |
 | setup | `setup` | the network: the task definition's proxy variables, or on the hosted verifier the `setup` secret |
-| baseline | a session's `test` commands, on the unmodified tree, before the ready report | the network only when the bootstrap says `"network": true` |
-| checks | everything after setup (`check`, `analysis`, `test`, `new_test`, a run's baseline) | the network only when the repository's setting allows it |
+| checks | everything after setup: `check`, `analysis`, `test`, `new_test`, and the baseline of a run or of a session | the network only when the repository's setting allows it |
+
+Setup ends at one point, the same in a run and in a session: after the last `setup` command and
+before any other command (the baseline included), the runner `PUT`s `{}` to `setup_done_url` and
+the platform revokes the `setup` secret there. A session's baseline therefore runs under the
+`checks` rule, never under the `setup` secret.
 
 **Hosted verifier** (`VERIFIER_PROXY_URL` set, and the bootstrap carries `proxy`). The task
 can reach nothing but the egress proxy, and the proxy admits a request only with a secret the
@@ -260,13 +264,18 @@ and stored only as hashes on the platform:
 * `setup` commands get `HTTP_PROXY`, `HTTPS_PROXY` and the lower-case forms set to
   `http://<user>:<setup>@<host:port>` (percent-encoded), and `NO_PROXY` set to
   `localhost,127.0.0.1,::1` so a repository's tests still reach the services they start.
-  The platform revokes the `setup` secret before any later command runs (when the ready
-  report of a session lands, when `setup_done_url` of a run is `PUT`), so a setup command
-  that saves it to disk saves a secret that is dead before anything else runs.
+  The platform revokes the `setup` secret when `setup_done_url` is `PUT` (a run and a session
+  alike), which happens before the baseline or any other later command runs, so a setup command
+  that saves it to disk saves a secret that is dead before anything else runs. The runner cannot
+  keep a setup command from writing what it was handed to a place a later command can read (both
+  are the same unprivileged user); revoking it is the control, and the runner does not run another
+  command when the platform did not take the message (a run ends with a `runner_error`, a session
+  is reported on `ready_url` with one).
 * Commands after setup get the same variables with the `checks` secret, which the platform
-  hands over only in the answer to the ready report (session) or to `setup_done_url`
-  (run), and only when the repository's setting is on. Without it they get no proxy
-  variable at all (not even `NO_PROXY`), and so no way to reach the network.
+  hands over only in the answer to `setup_done_url`, and only when the repository's setting
+  is on. Without it they get no proxy variable at all (not even `NO_PROXY`), and so no way to
+  reach the network. A session bootstrap that carries `proxy` and no `setup_done_url` is
+  refused (reported on `ready_url` as a `runner_error`) before anything is cloned.
 * The proxy secret on the wire is HTTP Basic `Proxy-Authorization`, whose decoded value is
   `<kind>:<id>:<secret>` with `<kind>` `run` or `session`; the proxy splits at the last
   colon into the user `<kind>:<id>` and the secret.
@@ -297,6 +306,7 @@ The session bootstrap carries `session` instead of `result_url` and `files`:
 {
   "session": {
     "ready_url": "one-time PUT for the clone, setup and baseline report",
+    "setup_done_url": "one-time PUT the runner makes once the last setup command has ended",
     "next_url": "GET, valid until end_at, answers the next job",
     "end_at": "2026-10-21T12:30:00Z",
     "idle_seconds": 300,
@@ -321,16 +331,20 @@ reported on `ready_url` as a `runner_error` (when `ready_url` itself can be read
 exits `0`.
 
 1. **Boot.** One clock, `setup_seconds`, for all of it. The runner clones `base_sha`, runs every
-   `setup` command, then every `test` command on the unmodified tree (the session's baseline),
-   and `PUT`s the ready report to `ready_url`: the result schema (below) with the clone step,
+   `setup` command, `PUT`s `{}` to `setup_done_url` (the network rule, above), runs every `test`
+   command on the unmodified tree (the session's baseline, under the `checks` rule) and `PUT`s
+   the ready report to `ready_url`: the result schema (below) with the clone step,
    one step per `setup` command, and one step named `baseline` per `test` command, each with
    the `index` of its command. A red baseline does not end the session (the step says so and
    `baseline_green` is `false`); a failed `setup` command does: the runner reports it and
    exits `0`, and runs no job. A clone that fails is a `clone` step with status `error`, a
    `runner_error`, and the same exit.
-2. **Ready answer.** The answer to the ready report may carry `{"proxy": {"checks": "<secret>"}}`
-   (the network rule). A ready report the platform answers `409` or `410` ends the runner
-   with exit `0`; any other refusal with exit `1`.
+2. **Setup done and the ready answer.** The answer to `setup_done_url` may carry
+   `{"proxy": {"checks": "<secret>"}}` (the network rule); the answer to the ready report carries
+   nothing the runner reads. A session whose `setup_done_url` the platform did not accept is
+   reported on `ready_url` with a `runner_error` and no baseline, and the runner exits `0`. A
+   ready report the platform answers `409` or `410` ends the runner with exit `0`; any other
+   refusal with exit `1`.
 3. **Loop.** `GET next_url?after=<seq of the last job answered>` (`after=0` first), with a
    timeout of 40 seconds (the platform holds a request up to 20 seconds):
 
@@ -481,9 +495,9 @@ ignored cache kept); that the job clock holds against a command that ignores `SI
 runner exits on `410` and when idle; that no URL or secret is on any command line (a scanner
 running as root for the whole run looks) or in a command's environment; and, through a local
 proxy that admits only the secrets the platform lists as live, that a job command opening a
-connection to an allowed host fails after the ready report when the network rule is off and
-succeeds when it is on, and that the secret a `setup` command saved is refused after the ready
-report. `tests/test_session.py` and `tests/test_session_network.py` run the same cases, and the
+connection to an allowed host fails after setup when the network rule is off and succeeds when it
+is on, and that the secret a `setup` command saved is refused once setup is done, for the
+baseline as for every later command. `tests/test_session.py` and `tests/test_session_network.py` run the same cases, and the
 back-off table, against `run.sh` without Docker.
 
 ### The one scanner exception: pip's `pkg_resources` (CVE-2025-47273)
