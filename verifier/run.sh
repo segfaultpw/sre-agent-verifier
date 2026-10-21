@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# The verifier runner. One run, one repository, one patch, then it exits.
+# The verifier runner. One run, one repository, one patch, then it exits. Version 3 adds
+# session mode: the same image can also serve a sequence of jobs for one fix, over one
+# clone, until the platform ends the session (see "Session mode" in verifier/contract.md).
 # The contract it implements is verifier/contract.md; read that first.
 #
 # Trust model in one paragraph: this script holds a read-only token and a one-time
@@ -39,6 +41,7 @@ SANDBOX_USER=${VERIFIER_SANDBOX_USER:-sandbox}
 # Proxy settings come from the task definition, not from the platform's response.
 # They are forwarded to the steps (package managers need them).
 PROXY_VARS=(HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy)
+RUNNER_VERSION=3
 
 EXCERPT_FLOOR=400
 RESULT_BUDGET=56000
@@ -342,50 +345,65 @@ run_step() {
   if [ "$do_record" = yes ]; then record "$name" "$status" "$duration" "$LAST_EXCERPT" "$rc" "$index" "$LAST_LIMIT"; fi
 }
 
+
 # ---------------------------------------------------------------------------
 # The result. Always written and always uploaded once the bootstrap has been read,
 # even when the run could not start: a silent runner holds the organization's
 # running slot until the reaper. The result URL is in a file only root can open, and
-# curl reads it from there: it is on no command line.
+# curl reads it from there: it is on no command line. A session reports the same way:
+# once for the ready report, once per job.
 # ---------------------------------------------------------------------------
-finish() {
-  local count per result attempt code
+build_result() {
+  # build_result FILE: the result schema, from the steps recorded so far.
+  local out=$1 count per
   count=$(wc -l <"$STEPS_FILE")
   if [ "$count" -lt 1 ]; then count=1; fi
   per=$((RESULT_BUDGET / count))
   if [ "$per" -gt 3500 ]; then per=3500; fi
   if [ "$per" -lt "$EXCERPT_FLOOR" ]; then per=$EXCERPT_FLOOR; fi
 
-  result="$OUT/result.json"
   jq -n \
     --argjson baseline "$BASELINE_GREEN" \
     --arg runner_error "$RUNNER_ERROR" \
     --arg runtime "$RUNTIME" \
+    --argjson version "$RUNNER_VERSION" \
     --argjson per "$per" \
     --slurpfile steps "$STEPS_FILE" \
     '{schema: 1, baseline_green: $baseline,
       steps: ($steps | map(.excerpt |= (.[-$per:]))),
-      runner: {runtime: $runtime, version: 2}}
-     + (if $runner_error == "" then {} else {runner_error: $runner_error} end)' >"$result"
+      runner: {runtime: $runtime, version: $version}}
+     + (if $runner_error == "" then {} else {runner_error: $runner_error} end)' >"$out"
+}
 
+# put_json CONFIG FILE: PUT FILE to the URL in the curl config CONFIG, again after two seconds
+# on a network error or a 5xx (three attempts). Answers 0 for a 2xx; the last HTTP status
+# (000 for none) is left in PUT_CODE and the answer's body in $OUT/response.txt.
+PUT_CODE=000
+put_json() {
+  local config=$1 file=$2 attempt
+  PUT_CODE=000
   for attempt in 1 2 3; do
-    code=$(curl -sS --config "$RESULT_CONFIG" -o "$OUT/response.txt" -w '%{http_code}' --max-time 60 \
-      -X PUT -H 'content-type: application/json' --data-binary @"$result") || code=000
-    case "$code" in
-      2??)
-        log "result accepted"
-        exit 0
-        ;;
+    PUT_CODE=$(curl -sS --config "$config" -o "$OUT/response.txt" -w '%{http_code}' --max-time 60 \
+      -X PUT -H 'content-type: application/json' --data-binary @"$file") || PUT_CODE=000
+    case "$PUT_CODE" in
+      2??) return 0 ;;
       000 | 5??)
-        log "upload attempt $attempt failed ($code)"
+        log "upload attempt $attempt failed ($PUT_CODE)"
         sleep 2
         ;;
-      *)
-        log "result refused ($code)"
-        exit 1
-        ;;
+      *) return 1 ;;
     esac
   done
+  return 1
+}
+
+finish() {
+  build_result "$OUT/result.json"
+  if put_json "$RESULT_CONFIG" "$OUT/result.json"; then
+    log "result accepted"
+    exit 0
+  fi
+  case "$PUT_CODE" in 000 | 5??) ;; *) log "result refused ($PUT_CODE)" ;; esac
   exit 1
 }
 
@@ -396,9 +414,8 @@ fail_run() {
 }
 
 # ---------------------------------------------------------------------------
-# The bootstrap: one GET of the one URL the task was started with. Everything the
-# task needs comes back over HTTPS and nothing of it was in the RunTask request. The
-# URL goes to curl through a file, like the result URL later.
+# The URLs. Each goes to curl through a file only root can open, so it is on no command
+# line.
 # ---------------------------------------------------------------------------
 curl_config() {
   # curl_config FILE URL: a config file holding one URL, readable by root only.
@@ -412,121 +429,86 @@ curl_config() {
   (umask 077 && printf 'url = "%s"\n' "$url" >"$file")
 }
 
+# with_query URL PARAM: the URL with one more query parameter, in REPLY.
+with_query() {
+  case "$1" in
+    *'?'*) REPLY="$1&$2" ;;
+    *) REPLY="$1?$2" ;;
+  esac
+}
+
+# json_string FILE FILTER: a string out of a JSON file, in REPLY; empty when it is not one.
+json_string() {
+  REPLY=$(jq -r "($2) | if type == \"string\" then . else \"\" end" "$1" 2>/dev/null) || REPLY=""
+}
+
 BOOTSTRAP_CONFIG="$OUT/bootstrap.curl"
 RESULT_CONFIG="$OUT/result.curl"
+READY_CONFIG="$OUT/ready.curl"
+NEXT_CONFIG="$OUT/next.curl"
+JOB_RESULT_CONFIG="$OUT/job-result.curl"
 BOOTSTRAP_FILE="$OUT/bootstrap.json"
-
-if ! curl_config "$BOOTSTRAP_CONFIG" "$BOOTSTRAP_URL"; then exit 1; fi
-unset BOOTSTRAP_URL
-
-bootstrap_code=000
-for attempt in 1 2 3; do
-  bootstrap_code=$(curl -sS --config "$BOOTSTRAP_CONFIG" -o "$BOOTSTRAP_FILE" -w '%{http_code}' --max-time 60) || bootstrap_code=000
-  case "$bootstrap_code" in
-    2??) break ;;
-    000 | 5??) sleep 2 ;;
-    *) break ;;
-  esac
-done
-chmod 0600 "$BOOTSTRAP_FILE" 2>/dev/null
-
-# Without the bootstrap there is no result URL, so nothing can be reported: the
-# platform ends the run at its deadline.
-case "$bootstrap_code" in
-  2??) ;;
-  *)
-    log "the bootstrap was refused or unreachable ($bootstrap_code); nothing can be reported"
-    exit 1
-    ;;
-esac
-
-if ! jq -e '(.repo_url | type == "string") and (.result_url | type == "string") and (.steps | type == "array") and (.files | type == "array")' "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
-  log "the bootstrap is not what the contract says; nothing can be reported"
-  exit 1
-fi
-
-if ! curl_config "$RESULT_CONFIG" "$(jq -r .result_url "$BOOTSTRAP_FILE")"; then exit 1; fi
-REPO_URL=$(jq -r .repo_url "$BOOTSTRAP_FILE")
-REPO_TOKEN=$(jq -r '.repo_token // ""' "$BOOTSTRAP_FILE")
-BASE_SHA=$(jq -r '.base_sha // ""' "$BOOTSTRAP_FILE")
-WALL_CLOCK_SECONDS=$(jq -r '.wall_clock_seconds // 900' "$BOOTSTRAP_FILE")
-MAX_OUTPUT_BYTES=$(jq -r '.max_output_bytes // 1000000' "$BOOTSTRAP_FILE")
-STEPS_JSON=$(jq -c .steps "$BOOTSTRAP_FILE")
-# The platform's static analysis rules, file name to text, when the run has an analysis
-# command. Anything that is not an object stays a string, which the check below refuses.
-RULES_JSON=$(jq -c 'if (.analysis | type) == "object" then (.analysis.files // {}) elif .analysis == null then {} else "invalid" end' "$BOOTSTRAP_FILE")
-PATCH_FILE="$OUT/patch.json"
-jq -c '{files: .files}' "$BOOTSTRAP_FILE" >"$PATCH_FILE"
-# The token has been read; the response that carried it is not kept.
-rm -f "$BOOTSTRAP_FILE"
-
-case "$WALL_CLOCK_SECONDS" in '' | *[!0-9]*) WALL_CLOCK_SECONDS=900 ;; esac
-case "$MAX_OUTPUT_BYTES" in '' | *[!0-9]* | 0) MAX_OUTPUT_BYTES=1000000 ;; esac
-# The upload needs its own thirty seconds at the end.
-DEADLINE=$((WALL_CLOCK_SECONDS - 30))
-
-# ---------------------------------------------------------------------------
-# Checks on the input.
-# ---------------------------------------------------------------------------
-if [ -n "$RUNNER_ERROR" ]; then fail_run "$RUNNER_ERROR"; fi
-if [ -z "$REPO_URL" ]; then fail_run "the bootstrap named no repository"; fi
-
-# The rule pack is written below, by this process, to a directory of its own: only plain
-# `.yml` file names, at most 20 files of at most 20,000 bytes each, so a name can never
-# point outside it and the pack can never grow without bound.
-if ! jq -e 'type == "object" and length <= 20 and all(to_entries[]; (.key | test("^[a-z0-9][a-z0-9-]{0,60}[.]yml$")) and (.value | type == "string" and utf8bytelength <= 20000))' <<<"$RULES_JSON" >/dev/null 2>&1; then
-  fail_run "the bootstrap's rule pack is not what the contract says"
-fi
+JOB_FILE="$OUT/job.json"
 
 # ---------------------------------------------------------------------------
 # Clone at the base commit into a root-owned staging directory nobody else can
 # reach. The token is used for this one command, through git's own environment
 # configuration, so it is written to no file and no git config and is on no command
-# line. Once the tree is complete it is handed to the unprivileged user and moved into
-# place with one rename: root never writes inside a directory that user can write.
+# line. Once the tree is complete it is handed to the
+# unprivileged user and moved into place with one rename: root never writes inside a
+# directory that user can write. The fetch is held to the clock.
 # ---------------------------------------------------------------------------
-clone_started=$(now_ms)
-mkdir -p "$STAGE"
-(
-  cd "$STAGE" || exit 1
-  git init -q . || exit 1
-  git remote add origin "$REPO_URL" || exit 1
-  export GIT_TERMINAL_PROMPT=0
-  if [ -n "$REPO_TOKEN" ]; then
-    auth=$(printf 'x-access-token:%s' "$REPO_TOKEN" | base64 -w0)
-    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
-      git fetch -q --depth 1 --no-tags origin "${BASE_SHA:-HEAD}" || exit 1
-  else
-    git fetch -q --depth 1 --no-tags origin "${BASE_SHA:-HEAD}" || exit 1
+do_clone() {
+  local clone_started clone_rc clone_text remaining
+  clone_started=$(now_ms)
+  remaining=$((DEADLINE - SECONDS))
+  if [ "$remaining" -lt 1 ]; then remaining=1; fi
+  mkdir -p "$STAGE"
+  (
+    cd "$STAGE" || exit 1
+    git init -q . || exit 1
+    git remote add origin "$REPO_URL" || exit 1
+    export GIT_TERMINAL_PROMPT=0
+    n=0
+    if [ -n "$REPO_TOKEN" ]; then
+      auth=$(printf 'x-access-token:%s' "$REPO_TOKEN" | base64 -w0)
+      export "GIT_CONFIG_KEY_$n=http.extraheader" "GIT_CONFIG_VALUE_$n=Authorization: Basic $auth"
+      n=$((n + 1))
+    fi
+    export GIT_CONFIG_COUNT=$n
+    timeout -k 5 "$remaining" git fetch -q --depth 1 --no-tags origin "${BASE_SHA:-HEAD}" || exit 1
+    unset GIT_CONFIG_COUNT auth
+    git checkout -q FETCH_HEAD || exit 1
+  ) >"$OUT/clone.log" 2>&1
+  clone_rc=$?
+  if [ "$clone_rc" -ne 0 ]; then
+    if [ "$clone_rc" -eq 124 ] || [ "$clone_rc" -eq 137 ]; then
+      clone_text="the clone was cut off by the clock"
+    else
+      clone_text=$(tail -c 1500 "$OUT/clone.log" | tr -d '\000')
+    fi
+    if [ -n "$REPO_TOKEN" ]; then clone_text=${clone_text//"$REPO_TOKEN"/[token]}; fi
+    record clone error $(($(now_ms) - clone_started)) "$clone_text"
+    unset REPO_TOKEN
+    return 1
   fi
-  git checkout -q FETCH_HEAD || exit 1
-) >"$OUT/clone.log" 2>&1
-clone_rc=$?
-if [ "$clone_rc" -ne 0 ]; then
-  clone_text=$(tail -c 1500 "$OUT/clone.log" | tr -d '\000')
-  if [ -n "$REPO_TOKEN" ]; then clone_text=${clone_text//"$REPO_TOKEN"/[token]}; fi
-  record clone error $(($(now_ms) - clone_started)) "$clone_text"
-  fail_run "the repository could not be cloned"
-fi
-unset REPO_TOKEN auth
+  unset REPO_TOKEN
 
-if [ -n "$SANDBOX_UID" ]; then
-  chown -R "$SANDBOX_UID:$SANDBOX_GID" "$STAGE"
-  chmod 0711 "$WORK"
-fi
-mv "$STAGE" "$REPO"
-record clone pass $(($(now_ms) - clone_started)) ""
+  if [ -n "$SANDBOX_UID" ]; then
+    chown -R "$SANDBOX_UID:$SANDBOX_GID" "$STAGE"
+    chmod 0711 "$WORK"
+  fi
+  mv "$STAGE" "$REPO"
+  record clone pass $(($(now_ms) - clone_started)) ""
+}
 
 # ---------------------------------------------------------------------------
-# The patch: already in hand, from the bootstrap. Paths are checked again (the
+# The patch (a run) or a job's files (a session). Paths are checked again (the
 # platform already contained them) because this is the process that decides where it
 # is written, and every write is then made by the unprivileged user.
 # ---------------------------------------------------------------------------
-if ! jq -e '(.files | type == "array") and (.files | length > 0) and (.files | length <= 20)' "$PATCH_FILE" >/dev/null 2>&1; then
-  fail_run "the patch is not a list of 1 to 20 files"
-fi
-
-FILE_COUNT=$(jq '.files | length' "$PATCH_FILE")
+PATCH_FILE="$OUT/patch.json"
+FILE_COUNT=0
 WRITTEN="$OUT/written.list"
 : >"$WRITTEN"
 # Each file's content, written by root into a directory only root can write, so the
@@ -560,17 +542,22 @@ out_of_time() {
 # apply_files all|tests. Each file is written by the unprivileged user from a file only
 # root can write: a leftover process of the repository cannot turn this into a
 # privileged write, and a FIFO planted where the file goes cannot hold the runner past
-# its clock.
+# its clock. Answers 0, 124 when the clock ran out, or 1 with APPLY_ERROR.
+APPLY_ERROR=""
 apply_files() {
   local which=$1 i path is_test rc
+  APPLY_ERROR=""
   for ((i = 0; i < FILE_COUNT; i++)); do
     path=$(jq -r ".files[$i].path" "$PATCH_FILE")
     is_test=$(jq -r ".files[$i].test == true" "$PATCH_FILE")
     if [ "$which" = tests ] && [ "$is_test" != true ]; then continue; fi
-    if ! safe_path "$path"; then fail_run "the patch names a path the runner refuses"; fi
+    if ! safe_path "$path"; then
+      APPLY_ERROR="the patch names a path the runner refuses"
+      return 1
+    fi
     sandbox_op "${GIT[@]}" ls-files --error-unmatch -- "$path"
     rc=$?
-    if [ "$rc" -eq 124 ]; then out_of_time; fi
+    if [ "$rc" -eq 124 ]; then return 124; fi
     if [ "$rc" -eq 0 ]; then
       printf 'tracked\t%s\n' "$path" >>"$WRITTEN"
     else
@@ -580,9 +567,25 @@ apply_files() {
     chmod 0644 "$INCOMING/$i"
     sandbox_op sh -c 'mkdir -p -- "$(dirname -- "$1")" && cat -- "$2" >"$1"' sh "$path" "$INCOMING/$i"
     rc=$?
-    if [ "$rc" -eq 124 ]; then out_of_time; fi
-    if [ "$rc" -ne 0 ]; then fail_run "the patch could not be written"; fi
+    if [ "$rc" -eq 124 ]; then return 124; fi
+    if [ "$rc" -ne 0 ]; then
+      APPLY_ERROR="the patch could not be written"
+      return 1
+    fi
   done
+  return 0
+}
+
+# apply_or_end all|tests: apply_files for a run, which ends at the first refusal.
+apply_or_end() {
+  local rc
+  apply_files "$1"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    124) out_of_time ;;
+    *) fail_run "$APPLY_ERROR" ;;
+  esac
 }
 
 # Put every written file back as it was: tracked files from git, new ones removed, both
@@ -605,23 +608,454 @@ revert_written() {
 # ---------------------------------------------------------------------------
 # The steps, by kind.
 # ---------------------------------------------------------------------------
+STEPS_JSON="[]"
+commands_of() { jq -c --arg kind "$1" '.[] | select(.kind == $kind)' <<<"$STEPS_JSON"; }
+
+# The platform's rule pack: only plain `.yml` file names, at most 20 files of at most 20,000
+# bytes each, so a name can never point outside the directory and the pack can never grow
+# without bound.
+RULES_JSON="{}"
+rules_valid() {
+  jq -e 'type == "object" and length <= 20 and all(to_entries[]; (.key | test("^[a-z0-9][a-z0-9-]{0,60}[.]yml$")) and (.value | type == "string" and utf8bytelength <= 20000))' <<<"$RULES_JSON" >/dev/null 2>&1
+}
+
+# The rule pack, written by root into a directory only root can write, which the analysis
+# commands read as {rules_dir}. Nothing of the repository is in it.
+RULES_DIR="$WORK/rules"
+RULES_DIR_QUOTED=$(printf '%q' "$RULES_DIR")
+write_rules() {
+  local rule_name
+  if [ "$(jq 'length' <<<"$RULES_JSON")" -gt 0 ]; then
+    install -d -m 0755 "$RULES_DIR"
+    while IFS= read -r rule_name; do
+      jq -j --arg k "$rule_name" '.[$k]' <<<"$RULES_JSON" >"$RULES_DIR/$rule_name"
+      chmod 0644 "$RULES_DIR/$rule_name"
+    done < <(jq -r 'keys[]' <<<"$RULES_JSON")
+  fi
+}
+
+# Static analysis on the files the proposal touches. A finding is evidence for the person
+# reading the pull request and never a verdict, and a tool this image does not carry is
+# `skipped` (the shell's "command not found", 127), not a failure: the platform judges
+# neither, it shows them.
+run_analysis_step() {
+  local name=$1 index=$2 cmd=$3
+  cmd=${cmd//\{rules_dir\}/$RULES_DIR_QUOTED}
+  run_step "$name" "$cmd" "$index" no no
+  if [ "$LAST_STATUS" = fail ] && [ "$LAST_RC" = 127 ]; then
+    record "$name" skipped "$LAST_DURATION" "the analysis tool is not installed in this image, so nothing was analysed" "$LAST_RC" "$index"
+  else
+    record "$name" "$LAST_STATUS" "$LAST_DURATION" "$LAST_EXCERPT" "$LAST_RC" "$index" "$LAST_LIMIT"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Session mode (runner version 3). One clone, one setup, a baseline, a ready report, then
+# jobs until the platform says the session is over. Each job starts from the base commit
+# exactly (the previous job's edits, commits and strays are gone), is held to its own
+# clock, and is reported on its own URL; nothing a job started outlives it.
+# ---------------------------------------------------------------------------
+
+# fail_ready MESSAGE: the session cannot start. Say so on the ready URL, then end.
+fail_ready() {
+  RUNNER_ERROR=$1
+  BASELINE_GREEN=false
+  log "$1"
+  build_result "$OUT/ready.json"
+  put_json "$READY_CONFIG" "$OUT/ready.json" || log "the ready report was not accepted ($PUT_CODE)"
+  exit 0
+}
+
+# What git needs to be told before a job, that the previous job could have changed: its
+# own configuration (filters, hooks, fsmonitor), the exclude and attributes files that
+# decide what `clean` removes, and the index, whose assume-unchanged and skip-worktree
+# flags can hide an edit from a restore. The configuration and the exclude file come back
+# from copies taken right after the clone, held where only root can write.
+PRISTINE="$WORK/pristine"
+snapshot_git_state() {
+  install -d -m 0755 "$PRISTINE"
+  cp -- "$REPO/.git/config" "$PRISTINE/config"
+  if [ -e "$REPO/.git/info/exclude" ]; then cp -- "$REPO/.git/info/exclude" "$PRISTINE/exclude"; fi
+  chmod -R a+rX "$PRISTINE"
+}
+
+# restore_tree: the tree as the base commit has it, as the unprivileged user and under
+# the job's clock. Answers 0, or the failing operation's status (124 for the clock).
+restore_tree() {
+  local rc
+  sandbox_op sh -c 'rm -rf -- .git/config .git/index .git/info/exclude .git/info/attributes .git/info/sparse-checkout && mkdir -p .git/info && cp -- "$1" .git/config && { [ ! -e "$2" ] || cp -- "$2" .git/info/exclude; }' sh "$PRISTINE/config" "$PRISTINE/exclude"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  sandbox_op "${GIT[@]}" update-ref --no-deref HEAD "$BASE_SHA"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  sandbox_op "${GIT[@]}" read-tree --reset -u "$BASE_SHA"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  # Untracked files and directories (nested repositories too) that are not ignored; never
+  # -x, so the ignored caches setup built survive.
+  sandbox_op "${GIT[@]}" clean -ffdq
+}
+
+# snapshot_name INDEX: the name the session's snapshot gives a command, in REPLY. A job's
+# own spelling of it is never used.
+snapshot_name() {
+  REPLY=$(jq -r --argjson i "$1" '.[] | select(.index == $i) | .name' "$OUT/snapshot.json")
+}
+
+# job_run SEQ: restores the tree, writes the job's files and runs its steps in kind order.
+# Records into STEPS_FILE; a refusal is left in RUNNER_ERROR, and END_SESSION is set when the
+# tree can no longer be trusted or the clock ended the job.
+job_run() {
+  local rc kind entry index name cmd
+  if ! jq -e '(.files | type == "array") and all(.files[]; (.path | type == "string") and (.content | type == "string"))' "$JOB_FILE" >/dev/null 2>&1; then
+    RUNNER_ERROR="the job's files are not a list of paths and contents"
+    return
+  fi
+  if [ "$(jq '.files | length' "$JOB_FILE")" -gt 20 ]; then
+    RUNNER_ERROR="the job carries more than 20 files"
+    return
+  fi
+  if ! jq -e --slurpfile snap "$OUT/snapshot.json" '
+      (.steps | type == "array" and length <= 12) and
+      all(.steps[]; (type == "object") and (.kind | IN("check", "analysis", "test", "new_test")) and (.cmd | type == "string")
+        and (. as $s | any($snap[0][]; .index == $s.index and .kind == $s.kind)))' "$JOB_FILE" >/dev/null 2>&1; then
+    RUNNER_ERROR="the job names a command that is not in the session's snapshot"
+    return
+  fi
+
+  restore_tree
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    record patch timeout 0 "the wall clock was used up while the runner was preparing the tree"
+    END_SESSION=true
+    return
+  elif [ "$rc" -ne 0 ]; then
+    RUNNER_ERROR="the tree could not be restored to the base commit"
+    END_SESSION=true
+    return
+  fi
+
+  PATCH_FILE=$JOB_FILE
+  FILE_COUNT=$(jq '.files | length' "$JOB_FILE")
+  : >"$WRITTEN"
+  apply_files all
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    record patch timeout 0 "the wall clock was used up while the runner was preparing the tree"
+    END_SESSION=true
+    return
+  elif [ "$rc" -ne 0 ]; then
+    RUNNER_ERROR=${APPLY_ERROR/the patch/the job}
+    return
+  fi
+
+  for kind in check analysis test new_test; do
+    while IFS= read -r entry; do
+      [ -n "$entry" ] || continue
+      index=$(jq -r '.index' <<<"$entry")
+      cmd=$(jq -r '.cmd' <<<"$entry")
+      snapshot_name "$index"
+      name=$REPLY
+      if [ "$kind" = analysis ]; then
+        run_analysis_step "$name" "$index" "$cmd"
+      else
+        run_step "$name" "$cmd" "$index"
+      fi
+      if [ "$LAST_STATUS" = timeout ]; then END_SESSION=true; fi
+    done < <(jq -c --arg k "$kind" '.steps[] | select(.kind == $k)' "$JOB_FILE")
+  done
+}
+
+# handle_job: runs the job in JOB_FILE and reports it. Answers 1 for a job that cannot be
+# reported at all (no seq, no result URL, a seq already answered); exits the runner when
+# the platform says the session is over or refuses the result.
+handle_job() {
+  local seq result_url now budget
+  seq=$(jq -r '.seq | if type == "number" and . >= 1 and . == floor then tostring else "" end' "$JOB_FILE" 2>/dev/null)
+  json_string "$JOB_FILE" '.result_url'
+  result_url=$REPLY
+  if [ -z "$seq" ] || [ -z "$result_url" ]; then
+    log "the job names no seq or no result URL, so it cannot be reported"
+    return 1
+  fi
+  if [ "$seq" -le "$LAST_SEQ" ]; then
+    log "the job's seq ($seq) is not after the last one answered ($LAST_SEQ); ignored"
+    return 1
+  fi
+  if ! curl_config "$JOB_RESULT_CONFIG" "$result_url"; then return 1; fi
+
+  : >"$STEPS_FILE"
+  RUNNER_ERROR=""
+  BASELINE_GREEN=true
+  END_SESSION=false
+  printf -v now '%(%s)T' -1
+  budget=$JOB_SECONDS
+  if [ $((END_EPOCH - now)) -lt "$budget" ]; then budget=$((END_EPOCH - now)); fi
+  DEADLINE=$((SECONDS + budget))
+
+  job_run
+
+  build_result "$OUT/job-result.json"
+  put_json "$JOB_RESULT_CONFIG" "$OUT/job-result.json"
+  case "$PUT_CODE" in
+    2??) ;;
+    410)
+      log "the session is over (the result was answered 410)"
+      exit 0
+      ;;
+    *)
+      log "the job's result was not accepted ($PUT_CODE)"
+      exit 1
+      ;;
+  esac
+  rm -f "$JOB_FILE" "$JOB_RESULT_CONFIG" "$OUT"/step-*.log "$INCOMING"/*
+  LAST_SEQ=$seq
+  IDLE_DEADLINE=$((SECONDS + IDLE_SECONDS))
+  if [ "$END_SESSION" = true ]; then
+    log "the session ends after this job"
+    exit 0
+  fi
+  return 0
+}
+
+# session_loop: asks for the next job until the platform ends the session (410), the
+# session is idle for IDLE_SECONDS, or it reaches its end time. A 404, a 429, a 5xx or no
+# answer at all is waited out (2, 4, 8, then 20 seconds), never past the end time or the idle
+# limit; any other answer ends the runner.
+LAST_SEQ=0
+IDLE_DEADLINE=0
+session_loop() {
+  local fails=0 delays=(2 4 8 20) now code started delay
+  IDLE_DEADLINE=$((SECONDS + IDLE_SECONDS))
+  while :; do
+    printf -v now '%(%s)T' -1
+    if [ "$now" -ge "$END_EPOCH" ]; then
+      log "the session has reached its end time"
+      exit 0
+    fi
+    if [ "$SECONDS" -ge "$IDLE_DEADLINE" ]; then
+      log "no job for $IDLE_SECONDS seconds; the session is idle"
+      exit 0
+    fi
+    with_query "$NEXT_URL" "after=$LAST_SEQ"
+    if ! curl_config "$NEXT_CONFIG" "$REPLY"; then exit 1; fi
+    started=$SECONDS
+    code=$(curl -sS --config "$NEXT_CONFIG" -o "$JOB_FILE" -w '%{http_code}' --max-time 40) || code=000
+    case "$code" in
+      200)
+        if handle_job; then
+          fails=0
+          continue
+        fi
+        ;;
+      204)
+        fails=0
+        # The platform holds the request for up to 20 seconds; an instant answer is not
+        # a reason to ask again at once.
+        if [ $((SECONDS - started)) -lt 1 ]; then sleep 1; fi
+        continue
+        ;;
+      410)
+        log "the session is over"
+        exit 0
+        ;;
+      404 | 429 | 5?? | 000) ;;
+      *)
+        log "the next request was refused ($code)"
+        exit 1
+        ;;
+    esac
+    delay=${delays[$((fails < 3 ? fails : 3))]}
+    fails=$((fails + 1))
+    printf -v now '%(%s)T' -1
+    if [ $((now + delay)) -ge "$END_EPOCH" ] || [ $((SECONDS + delay)) -ge "$IDLE_DEADLINE" ]; then
+      log "the next request answered $code and there is no time left to wait for it"
+      exit 0
+    fi
+    log "the next request answered $code; asking again in $delay seconds"
+    sleep "$delay"
+  done
+}
+
+SESSION_VALID='
+  (.session | type == "object")
+  and ((.session.ready_url | type) == "string")
+  and ((.session.next_url | type) == "string")
+  and ((.session.end_at | type) == "string")
+  and ([.session.idle_seconds, .session.job_seconds, .session.setup_seconds]
+       | all(type == "number" and . >= 1 and . <= 7200 and . == floor))
+  and ((.repo_url | type) == "string")
+  and ((.base_sha | type) == "string") and (.base_sha | length > 0)
+  and ((.steps | type) == "array") and (.steps | length <= 12)
+  and all(.steps[]; (type == "object") and (.index | type == "number" and . >= 0 and . == floor)
+       and ((.name | type) == "string") and (.kind | IN("setup", "check", "analysis", "test", "new_test"))
+       and ((.cmd | type) == "string"))
+  and ((.steps | map(.index) | unique | length) == (.steps | length))
+'
+
+session_main() {
+  local ready_url end_at entry SETUP_OK
+  json_string "$BOOTSTRAP_FILE" '.session.ready_url'
+  ready_url=$REPLY
+  if [ -z "$ready_url" ]; then
+    log "the session bootstrap names no ready URL; nothing can be reported"
+    exit 1
+  fi
+  if ! curl_config "$READY_CONFIG" "$ready_url"; then exit 1; fi
+  log "session mode"
+
+  if ! jq -e "$SESSION_VALID" "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
+    fail_ready "the session bootstrap is not what the contract says"
+  fi
+  json_string "$BOOTSTRAP_FILE" '.session.next_url'
+  NEXT_URL=$REPLY
+  json_string "$BOOTSTRAP_FILE" '.session.end_at'
+  end_at=$REPLY
+  IDLE_SECONDS=$(jq -r '.session.idle_seconds' "$BOOTSTRAP_FILE")
+  JOB_SECONDS=$(jq -r '.session.job_seconds' "$BOOTSTRAP_FILE")
+  local setup_seconds
+  setup_seconds=$(jq -r '.session.setup_seconds' "$BOOTSTRAP_FILE")
+  REPO_URL=$(jq -r '.repo_url' "$BOOTSTRAP_FILE")
+  REPO_TOKEN=$(jq -r '.repo_token // ""' "$BOOTSTRAP_FILE")
+  BASE_SHA=$(jq -r '.base_sha // ""' "$BOOTSTRAP_FILE")
+  MAX_OUTPUT_BYTES=$(jq -r '.max_output_bytes // 1000000' "$BOOTSTRAP_FILE")
+  STEPS_JSON=$(jq -c .steps "$BOOTSTRAP_FILE")
+  RULES_JSON=$(jq -c 'if (.analysis | type) == "object" then (.analysis.files // {}) elif .analysis == null then {} else "invalid" end' "$BOOTSTRAP_FILE")
+  printf '%s' "$STEPS_JSON" >"$OUT/snapshot.json"
+  # The token has been read; the response that carried it is not kept.
+  rm -f "$BOOTSTRAP_FILE"
+
+  case "$MAX_OUTPUT_BYTES" in '' | *[!0-9]* | 0) MAX_OUTPUT_BYTES=1000000 ;; esac
+  if ! [[ "$end_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?Z$ ]] ||
+    ! END_EPOCH=$(date -u -d "$end_at" +%s 2>/dev/null); then
+    fail_ready "the session bootstrap is not what the contract says"
+  fi
+  if ! rules_valid; then fail_ready "the bootstrap's rule pack is not what the contract says"; fi
+  if [ -n "$RUNNER_ERROR" ]; then fail_ready "$RUNNER_ERROR"; fi
+  if [ -z "$REPO_URL" ]; then fail_ready "the bootstrap named no repository"; fi
+
+  # Boot: clone, setup, the baseline on the unmodified tree. One clock for all of it.
+  DEADLINE=$((SECONDS + setup_seconds))
+  if ! do_clone; then fail_ready "the repository could not be cloned"; fi
+  snapshot_git_state
+  write_rules
+
+  SETUP_OK=true
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    run_step "$(jq -r .name <<<"$entry")" "$(jq -r .cmd <<<"$entry")" "$(jq -r '.index // empty' <<<"$entry")"
+    if [ "$LAST_STATUS" != pass ]; then SETUP_OK=false; fi
+  done < <(commands_of setup)
+  if [ "$SETUP_OK" != true ]; then
+    # Nothing can be judged on a tree that does not build, and no job can be run on it.
+    BASELINE_GREEN=false
+    build_result "$OUT/ready.json"
+    put_json "$READY_CONFIG" "$OUT/ready.json" || log "the ready report was not accepted ($PUT_CODE)"
+    exit 0
+  fi
+
+  # Every test command, each reported on its own: a red one does not end the session, the
+  # platform shows it as "red on the unmodified tree" next to the same command's result.
+  BASELINE_GREEN=true
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    run_step baseline "$(jq -r .cmd <<<"$entry")" "$(jq -r '.index // empty' <<<"$entry")"
+    if [ "$LAST_STATUS" != pass ]; then BASELINE_GREEN=false; fi
+  done < <(commands_of test)
+
+  build_result "$OUT/ready.json"
+  if ! put_json "$READY_CONFIG" "$OUT/ready.json"; then
+    log "the ready report was not accepted ($PUT_CODE)"
+    case "$PUT_CODE" in 409 | 410) exit 0 ;; *) exit 1 ;; esac
+  fi
+  : >"$STEPS_FILE"
+  session_loop
+}
+
+# ---------------------------------------------------------------------------
+# The bootstrap: one GET of the one URL the task was started with. Everything the
+# task needs comes back over HTTPS and nothing of it was in the RunTask request. The
+# URL goes to curl through a file, like the result URL later. ?runner=3 tells the
+# platform which runner this is, so a session is only ever given to one that knows
+# what a session is.
+# ---------------------------------------------------------------------------
+with_query "$BOOTSTRAP_URL" "runner=$RUNNER_VERSION"
+if ! curl_config "$BOOTSTRAP_CONFIG" "$REPLY"; then exit 1; fi
+unset BOOTSTRAP_URL
+
+bootstrap_code=000
+for attempt in 1 2 3; do
+  bootstrap_code=$(curl -sS --config "$BOOTSTRAP_CONFIG" -o "$BOOTSTRAP_FILE" -w '%{http_code}' --max-time 60) || bootstrap_code=000
+  case "$bootstrap_code" in
+    2??) break ;;
+    000 | 5??) sleep 2 ;;
+    *) break ;;
+  esac
+done
+chmod 0600 "$BOOTSTRAP_FILE" 2>/dev/null
+
+# Without the bootstrap there is no result URL, so nothing can be reported: the
+# platform ends the run at its deadline.
+case "$bootstrap_code" in
+  2??) ;;
+  *)
+    log "the bootstrap was refused or unreachable ($bootstrap_code); nothing can be reported"
+    exit 1
+    ;;
+esac
+
+if jq -e '(.session | type) == "object"' "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
+  session_main
+  exit 0
+fi
+
+if ! jq -e '(.repo_url | type == "string") and (.result_url | type == "string") and (.steps | type == "array") and (.files | type == "array")' "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
+  log "the bootstrap is not what the contract says; nothing can be reported"
+  exit 1
+fi
+
+if ! curl_config "$RESULT_CONFIG" "$(jq -r .result_url "$BOOTSTRAP_FILE")"; then exit 1; fi
+REPO_URL=$(jq -r .repo_url "$BOOTSTRAP_FILE")
+REPO_TOKEN=$(jq -r '.repo_token // ""' "$BOOTSTRAP_FILE")
+BASE_SHA=$(jq -r '.base_sha // ""' "$BOOTSTRAP_FILE")
+WALL_CLOCK_SECONDS=$(jq -r '.wall_clock_seconds // 900' "$BOOTSTRAP_FILE")
+MAX_OUTPUT_BYTES=$(jq -r '.max_output_bytes // 1000000' "$BOOTSTRAP_FILE")
+STEPS_JSON=$(jq -c .steps "$BOOTSTRAP_FILE")
+# The platform's static analysis rules, file name to text, when the run has an analysis
+# command. Anything that is not an object stays a string, which the check below refuses.
+RULES_JSON=$(jq -c 'if (.analysis | type) == "object" then (.analysis.files // {}) elif .analysis == null then {} else "invalid" end' "$BOOTSTRAP_FILE")
+jq -c '{files: .files}' "$BOOTSTRAP_FILE" >"$PATCH_FILE"
+# The token has been read; the response that carried it is not kept.
+rm -f "$BOOTSTRAP_FILE"
+
+case "$WALL_CLOCK_SECONDS" in '' | *[!0-9]*) WALL_CLOCK_SECONDS=900 ;; esac
+case "$MAX_OUTPUT_BYTES" in '' | *[!0-9]* | 0) MAX_OUTPUT_BYTES=1000000 ;; esac
+# The upload needs its own thirty seconds at the end.
+DEADLINE=$((WALL_CLOCK_SECONDS - 30))
+
+# ---------------------------------------------------------------------------
+# Checks on the input.
+# ---------------------------------------------------------------------------
+if [ -n "$RUNNER_ERROR" ]; then fail_run "$RUNNER_ERROR"; fi
+if [ -z "$REPO_URL" ]; then fail_run "the bootstrap named no repository"; fi
+if ! rules_valid; then fail_run "the bootstrap's rule pack is not what the contract says"; fi
+
+if ! do_clone; then fail_run "the repository could not be cloned"; fi
+
+# ---------------------------------------------------------------------------
+# The patch: already in hand, from the bootstrap.
+# ---------------------------------------------------------------------------
+if ! jq -e '(.files | type == "array") and (.files | length > 0) and (.files | length <= 20)' "$PATCH_FILE" >/dev/null 2>&1; then
+  fail_run "the patch is not a list of 1 to 20 files"
+fi
+FILE_COUNT=$(jq '.files | length' "$PATCH_FILE")
+
 if ! jq -e 'type == "array"' <<<"$STEPS_JSON" >/dev/null 2>&1; then
   fail_run "the bootstrap's steps are not a list"
 fi
 
-commands_of() { jq -c --arg kind "$1" '.[] | select(.kind == $kind)' <<<"$STEPS_JSON"; }
-
-# The platform's rule pack, written by root into a directory only root can write, which
-# the analysis commands read as {rules_dir}. Nothing of the repository is in it.
-RULES_DIR="$WORK/rules"
-if [ "$(jq 'length' <<<"$RULES_JSON")" -gt 0 ]; then
-  install -d -m 0755 "$RULES_DIR"
-  while IFS= read -r rule_name; do
-    jq -j --arg k "$rule_name" '.[$k]' <<<"$RULES_JSON" >"$RULES_DIR/$rule_name"
-    chmod 0644 "$RULES_DIR/$rule_name"
-  done < <(jq -r 'keys[]' <<<"$RULES_JSON")
-fi
-RULES_DIR_QUOTED=$(printf '%q' "$RULES_DIR")
+write_rules
 
 # setup: once, before anything is judged.
 SETUP_OK=true
@@ -679,7 +1113,7 @@ if [ -n "$NEW_TEST_ENTRY" ]; then
 fi
 HAS_TEST_FILE=$(jq '[.files[] | select(.test == true)] | length' "$PATCH_FILE")
 if [ -n "$NEW_TEST_CMD" ] && [ "$HAS_TEST_FILE" -gt 0 ]; then
-  apply_files tests
+  apply_or_end tests
   run_step new_test_fails_before "$NEW_TEST_CMD" "$NEW_TEST_INDEX" yes
   revert_written
 else
@@ -687,29 +1121,16 @@ else
 fi
 
 # the patch.
-apply_files all
+apply_or_end all
 
 while IFS= read -r entry; do
   [ -n "$entry" ] || continue
   run_step "$(jq -r .name <<<"$entry")" "$(jq -r .cmd <<<"$entry")" "$(jq -r '.index // empty' <<<"$entry")"
 done < <(commands_of check)
 
-# Static analysis on the files the proposal touches. A finding is evidence for the person
-# reading the pull request and never a verdict, and a tool this image does not carry is
-# `skipped` (the shell's "command not found", 127), not a failure: the platform judges
-# neither, it shows them.
 while IFS= read -r entry; do
   [ -n "$entry" ] || continue
-  analysis_name=$(jq -r .name <<<"$entry")
-  analysis_index=$(jq -r '.index // empty' <<<"$entry")
-  analysis_cmd=$(jq -r .cmd <<<"$entry")
-  analysis_cmd=${analysis_cmd//\{rules_dir\}/$RULES_DIR_QUOTED}
-  run_step "$analysis_name" "$analysis_cmd" "$analysis_index" no no
-  if [ "$LAST_STATUS" = fail ] && [ "$LAST_RC" = 127 ]; then
-    record "$analysis_name" skipped "$LAST_DURATION" "the analysis tool is not installed in this image, so nothing was analysed" "$LAST_RC" "$analysis_index"
-  else
-    record "$analysis_name" "$LAST_STATUS" "$LAST_DURATION" "$LAST_EXCERPT" "$LAST_RC" "$analysis_index" "$LAST_LIMIT"
-  fi
+  run_analysis_step "$(jq -r .name <<<"$entry")" "$(jq -r '.index // empty' <<<"$entry")" "$(jq -r .cmd <<<"$entry")"
 done < <(commands_of analysis)
 
 while IFS= read -r entry; do
