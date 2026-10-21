@@ -20,6 +20,22 @@
 #   * git hooks and untrusted git configuration the commands plant never run;
 #   * a sandbox user that is root is refused.
 #
+# Session mode (runner version 3), with the same uid separation:
+#
+#   * a daemon a job starts is dead before the next job, and the next job's tree is the base
+#     commit (a tracked file edited, an untracked file, a staged file, a planted git
+#     configuration, hook and exclude file all gone; an ignored cache kept), restored by the
+#     unprivileged user;
+#   * the job clock holds against a command that ignores SIGTERM and starts a daemon;
+#   * `setup` never reruns, a job naming an index outside the snapshot is refused, the
+#     runner exits on `410` and when idle, and no URL or secret is on any command line
+#     (a scanner running as root for the whole run looks) or in a command's environment;
+#   * the network rule, through a local proxy that admits only the secrets the platform
+#     lists as live: a job command that opens a connection to an allowed host fails after
+#     the ready report when the session says off and succeeds when on, the secret a setup
+#     command saved is refused after the ready report, and no secret is in a job command's
+#     environment.
+#
 # The go image also has a toolchain floor: Go 1.26.9 or later (the release that fixes the
 # standard library advisories the scan reported), checked with `go version` in the image.
 #
@@ -34,6 +50,17 @@ if [ "${#runtimes[@]}" -eq 0 ]; then runtimes=(node); fi
 fail() {
   echo "FAIL: $*" >&2
   exit 1
+}
+
+# Ends the servers a case started and removes the scratch directory (files the container
+# created are root's, so a container removes them).
+cleanup() {
+  local pid
+  for pid in "${server_pid:-}" "${proxy_pid:-}" "${allowed_pid:-}"; do
+    [ -z "$pid" ] || kill "$pid" 2>/dev/null || true
+  done
+  docker run --rm -v "$tmp:/t" busybox sh -c "rm -rf /t/* /t/.[!.]*" >/dev/null 2>&1 || true
+  rmdir "$tmp" 2>/dev/null || true
 }
 
 # run_case TAG TMP PORT BOOTSTRAP_JSON [DOCKER_ARG ...] [-- CONTAINER_ARG ...]
@@ -65,6 +92,250 @@ run_case() {
   kill "$server_pid" 2>/dev/null || true
 }
 
+# A scanner that runs as root for the whole run, as the container's first process (the runner
+# is exec'd after it): it looks at every command line on the machine, the runner's own curl,
+# git and jq among them, for the pieces of the URLs and secrets of a session, and writes
+# the matching lines to /scan/found, except the two bare words the run cases' own scanning daemon
+# (see `daemon` below) looks for. Each pattern has a character class in it, so the scanner's own
+# command line does not match what it looks for.
+scan_script='( while :; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr "\000" "\n" | grep -a -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" -e "SIGSECRE[T]" -e "RUNNERCRE[D]" -e "SETUPCRE[D]" -e "CHECKSCRE[D]" -e "job[s]/" -e "session[s]/" -e "afte[r]=" | grep -a -v -x -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" >>/scan/found; sleep 0.01; done ) >/dev/null 2>&1 &
+exec /usr/local/bin/verifier-run'
+
+jq_defs='def step($i; $n; $k; $c): {index: $i, name: $n, kind: $k, cmd: $c};
+  def job($seq; $steps; $files): {seq: $seq, files: $files, steps: $steps,
+    result_url: ("http://127.0.0.1:@PORT@/jobs/\($seq)/result")};
+  def session($end; $sha; $steps; $extra): {
+    session: ({ready_url: "http://127.0.0.1:@PORT@/sessions/s1/ready",
+               next_url: "http://127.0.0.1:@PORT@/sessions/s1/next",
+               end_at: $end, idle_seconds: 120, job_seconds: 120, setup_seconds: 300} + ($extra.session // {})),
+    repo_url: "file:///origin", repo_token: "ghs_contract_read_only_token", base_sha: $sha,
+    steps: $steps, max_output_bytes: 100000} + ($extra.bootstrap // {});'
+
+# run_session TAG TMP PORT SCENARIO RESULTS [DOCKER_ARG ...]
+# Starts the loopback platform on PORT in scenario mode, runs the image once against a session
+# bootstrap and leaves the platform's records in RESULTS (ready.json, result-<seq>.json,
+# events.jsonl). The scanner above runs as root in the container; its findings are in
+# RESULTS/scan/found. Leaves the seconds the container took in session_seconds.
+session_seconds=0
+run_session() {
+  local tag=$1 tmp=$2 port=$3 scenario=$4 results=$5
+  shift 5
+  local docker_args=("$@")
+  mkdir -p "$results/scan"
+  : >"$results/events.jsonl"
+  python3 "$here/test/fake_platform.py" --scenario "$scenario" --port "$port" --results "$results" --log "$results/events.jsonl" &
+  server_pid=$!
+  sleep 1
+  local started
+  started=$(date +%s)
+  docker run --rm --network host \
+    -v "$tmp/origin:/origin:ro" -v "$results/scan:/scan" \
+    -e "BOOTSTRAP_URL=http://127.0.0.1:$port/webhooks/verifier/sessions/s1/SIGSECRET/bootstrap" \
+    -e "AWS_SECRET_ACCESS_KEY=leak-aws" \
+    --entrypoint /bin/sh \
+    "${docker_args[@]}" \
+    "$tag" -c "$scan_script" || fail "the runner exited non-zero"
+  session_seconds=$(($(date +%s) - started))
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  server_pid=""
+  if [ -s "$results/scan/found" ]; then
+    cat "$results/scan/found" >&2
+    fail "the scanner saw a URL or a secret of the session on a command line"
+  fi
+}
+
+# expect_status FILE NAME STATUS WHAT: the first step named NAME in FILE has status STATUS.
+expect_status() {
+  local got
+  got=$(jq -r --arg n "$2" '[.steps[] | select(.name == $n)][0].status' "$1")
+  if [ "$got" != "$3" ]; then
+    jq . "$1" >&2
+    fail "$4: step $2 was '$got', not $3"
+  fi
+}
+
+# expect_all_pass FILE WHAT
+expect_all_pass() {
+  if ! jq -e '[.steps[] | select(.status != "pass")] | length == 0' "$1" >/dev/null; then
+    jq . "$1" >&2
+    fail "$2: not every step passed"
+  fi
+}
+
+# session_cases TAG TMP SHA: runner version 3's session mode inside the image, with the real
+# uid separation, against the fixture repository in $TMP/origin.
+session_cases() {
+  local tag=$1 tmp=$2 sha=$3
+  local end results scenario port
+  end=$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)
+
+  # Jobs 1 and 2 of the first session: job 1 edits a tracked file, leaves an untracked one, an
+  # ignored cache file, a staged file, a planted git configuration, hook and exclude file, and
+  # starts the daemons of the run cases; job 2 sees none of it, and the cache.
+  local tamper restored sprobe
+  tamper='echo tampered >README && echo stray >stray.txt && echo c >cache/job1-cache && echo y >staged.txt && git add staged.txt && rm calc.sh && echo "*" >>.git/info/exclude && echo h >hidden.txt && git config filter.slow.smudge "sleep 300; cat" && mkdir -p .git/hooks "$HOME/hooks2" && git config core.hooksPath "$HOME/hooks2" && printf "#!/bin/sh\ntouch \"$HOME/ran-hook\"\n" >.git/hooks/post-checkout && chmod +x .git/hooks/post-checkout'
+  restored='test "$(cat README)" = original || { echo "restored: README"; exit 1; }; test -f calc.sh || { echo "restored: calc.sh"; exit 1; }; ! test -e stray.txt || { echo "restored: stray"; exit 1; }; ! test -e staged.txt || { echo "restored: staged"; exit 1; }; ! test -e hidden.txt || { echo "restored: hidden"; exit 1; }; test -e cache/job1-cache || { echo "restored: cache"; exit 1; }; test -z "$(git status --porcelain --untracked-files=all | grep -v " test_new[.]sh$")" || { echo "restored: status: $(git status --porcelain --untracked-files=all | head -5)"; exit 1; }; ! git config --get filter.slow.smudge || { echo "restored: filter"; exit 1; }; ! git config --get core.hooksPath || { echo "restored: hooksPath"; exit 1; }; ! test -e "$HOME/ran-hook" || { echo "restored: hook ran"; exit 1; }; test "$(stat -c %u README)" = "$(id -u)" || { echo "restored: README owner"; exit 1; }; test "$(stat -c %u .git/config)" = "$(id -u)" || { echo "restored: config owner"; exit 1; }; exit 0'
+  sprobe='test -z "${BOOTSTRAP_URL:-}${REPO_TOKEN:-}${RESULT_URL:-}${NEXT_URL:-}${READY_URL:-}${AWS_SECRET_ACCESS_KEY:-}" && test -z "$(env | grep -E "leak|ghs_|127.0.0.1|bootstrap|SIGSECRE[T]|session[s]|job[s]/")"'
+
+  results=$(mktemp -d -p "$tmp")
+  scenario="$results/scenario.json"
+  port=$((20000 + RANDOM % 20000))
+  jq -n --arg end "$end" --arg sha "$sha" --arg daemon "$daemon" --arg tamper "$tamper" \
+    --arg restored "$restored" --arg leftover "$leftover_probe" --arg probe "$sprobe" \
+    --arg proc "$proc_probe" --arg dirp "$dir_probe" "$jq_defs"'
+    [step(0; "deps"; "setup"; "mkdir -p cache && echo run >> cache/setup-runs"),
+     step(1; "tests"; "test"; "sh test_old.sh"),
+     step(2; "tamper"; "check"; $tamper),
+     step(3; "daemon"; "check"; $daemon),
+     step(4; "leftover"; "check"; $leftover),
+     step(5; "restored"; "check"; $restored),
+     step(6; "env_probe"; "check"; $probe),
+     step(7; "proc_probe"; "check"; $proc),
+     step(8; "dir_probe"; "check"; $dirp),
+     step(9; "count"; "check"; "test \"$(grep -c run cache/setup-runs)\" = 1"),
+     step(10; "owner"; "check"; "test \"$(stat -c %u test_new.sh)\" = \"$(id -u)\"")] as $steps
+    | {bootstrap: session($end; $sha; $steps; {}),
+       next: [{status: 200, job: job(1; [$steps[2], $steps[3]]; [{path: "calc.sh", content: "echo 4\n", test: false}])},
+              {status: 200, job: job(2; $steps[4:]; [{path: "test_new.sh", content: "true\n", test: true}])},
+              {status: 200, job: job(3; [step(0; "deps"; "setup"; "echo run >> cache/setup-runs")]; [])},
+              {status: 200, job: job(4; [$steps[9]]; [])}]}' >"$scenario"
+  run_session "$tag" "$tmp" "$port" "$scenario" "$results"
+  expect_all_pass "$results/ready.json" "the session boot"
+  jq -e '.baseline_green == true and .runner.version == 3' "$results/ready.json" >/dev/null || fail "the ready report is not green, version 3"
+  expect_all_pass "$results/result-1.json" "job 1"
+  expect_all_pass "$results/result-2.json" "job 2 (a daemon from job 1 dead, the tree restored as the base commit)"
+  expect_all_pass "$results/result-4.json" "job 4 (setup did not rerun)"
+  jq -e '.steps == [] and (.runner_error | test("snapshot"))' "$results/result-3.json" >/dev/null || {
+    jq . "$results/result-3.json" >&2
+    fail "a job naming a setup command was not refused"
+  }
+  jq -e '[.[] | select(.path != null and (.path | endswith("/next")))] | length == 5' <(jq -s . "$results/events.jsonl") >/dev/null || {
+    jq -s . "$results/events.jsonl" >&2
+    fail "the runner did not ask for the next job four times and stop at the 410"
+  }
+  if grep -q 'ghs_contract_read_only_token\|leak-aws\|127.0.0.1\|SIGSECRET' "$results/ready.json" "$results"/result-*.json; then
+    fail "a secret or a URL leaked into a report"
+  fi
+
+  # The job clock holds against a command that ignores SIGTERM and starts a daemon that does
+  # too: the job is a timeout, the session ends, and the runner is gone well inside the bound.
+  results=$(mktemp -d -p "$tmp")
+  scenario="$results/scenario.json"
+  port=$((20000 + RANDOM % 20000))
+  jq -n --arg end "$end" --arg sha "$sha" "$jq_defs"'
+    [step(0; "tests"; "test"; "sh test_old.sh"),
+     step(1; "stubborn"; "check"; "trap \"\" TERM; setsid sh -c \"trap \\\"\\\" TERM; sleep 300\" >/dev/null 2>&1 & while true; do sleep 1; done"),
+     step(2; "lint"; "check"; "echo lint")] as $steps
+    | {bootstrap: session($end; $sha; $steps; {session: {job_seconds: 6}}),
+       next: [{status: 200, job: job(1; [$steps[1], $steps[2]]; [])}, {status: 200, job: job(2; [$steps[2]]; [])}]}' >"$scenario"
+  run_session "$tag" "$tmp" "$port" "$scenario" "$results"
+  expect_status "$results/result-1.json" stubborn timeout "the job clock"
+  [ "$session_seconds" -lt 60 ] || fail "a command that ignores SIGTERM held the session past its job clock ($session_seconds s)"
+  [ ! -e "$results/result-2.json" ] || fail "a session whose job timed out went on to another job"
+
+  # Idle: no job for idle_seconds ends the runner, and the 204 answers are not hammered.
+  results=$(mktemp -d -p "$tmp")
+  scenario="$results/scenario.json"
+  port=$((20000 + RANDOM % 20000))
+  jq -n --arg end "$end" --arg sha "$sha" "$jq_defs"'
+    [step(0; "tests"; "test"; "sh test_old.sh"), step(1; "lint"; "check"; "echo lint")] as $steps
+    | {bootstrap: session($end; $sha; $steps; {session: {idle_seconds: 4}}),
+       next: [{status: 200, job: job(1; [$steps[1]]; [])}], exhausted_status: 204}' >"$scenario"
+  run_session "$tag" "$tmp" "$port" "$scenario" "$results"
+  expect_all_pass "$results/result-1.json" "the job before the idle exit"
+  [ "$session_seconds" -lt 40 ] || fail "an idle session was not ended by its idle limit ($session_seconds s)"
+}
+
+# network_cases TAG TMP SHA: the network rule through a local proxy that admits only what the
+# fake platform lists as live (see fake_proxy.py), with the allowed host nameable only by it.
+network_cases() {
+  local tag=$1 tmp=$2 sha=$3
+  local end network results scenario port pport aport reach tunnel saved dead env_probe platform_probe checks_on
+  end=$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)
+
+  for network in off on; do
+    results=$(mktemp -d -p "$tmp")
+    scenario="$results/scenario.json"
+    port=$((20000 + RANDOM % 20000))
+    pport=$((port + 1))
+    aport=$((port + 2))
+    mkdir -p "$results/allowed"
+    printf 'allowed-ok' >"$results/allowed/index.html"
+    python3 -m http.server "$aport" --bind 127.0.0.1 --directory "$results/allowed" >/dev/null 2>&1 &
+    allowed_pid=$!
+    python3 "$here/test/fake_proxy.py" --port "$pport" --authorize "http://127.0.0.1:$port/authorize" \
+      --hosts "bootstrap=127.0.0.1:$port" --hosts "runner=127.0.0.1:$port" \
+      --hosts "setup=allowed.test:$aport" --hosts "checks=allowed.test:$aport" \
+      --map allowed.test=127.0.0.1 --log "$results/proxy.jsonl" &
+    proxy_pid=$!
+
+    # The proxy settings reach curl through the environment the runner built, never as an
+    # argument, so the scanner above has nothing of the secrets to find on a command line.
+    reach="curl -sS -f --max-time 10 http://allowed.test:$aport/ | grep -q allowed-ok"
+    tunnel="curl -sS -f --max-time 10 --proxytunnel http://allowed.test:$aport/ | grep -q allowed-ok"
+    saved="printf %s \"\$HTTPS_PROXY\" >\"\$HOME/cred\" && $reach"
+    dead="test -s \"\$HOME/cred\" && ! http_proxy=\"\$(cat \"\$HOME/cred\")\" curl -sS -f --max-time 10 http://allowed.test:$aport/"
+    # The platform's address is built here and handed to curl on its standard input, so it is on no
+    # command line either.
+    platform_probe="h=127.0.0; ! printf 'url = \"http://%s.1:%s/%s/s1/next\"\\n' \"\$h\" $port sessions | curl -sS -f --max-time 10 --noproxy x.invalid -K -"
+    if [ "$network" = on ]; then
+      checks_on=true
+      env_probe='test -n "$HTTPS_PROXY" && test -z "$(env | grep -E "SETUPCRE[D]|RUNNERCRE[D]|SIGSECRE[T]")" && env | grep -q CHECKSCRE[D]'
+    else
+      checks_on=false
+      env_probe='test -z "$(env | grep -i -E "proxy|SETUPCRE[D]|CHECKSCRE[D]|RUNNERCRE[D]|SIGSECRE[T]")"'
+    fi
+
+    jq -n --arg end "$end" --arg sha "$sha" --arg saved "$saved" --arg reach "$reach" --arg tunnel "$tunnel" \
+      --arg dead "$dead" --arg env_probe "$env_probe" --arg platform "$platform_probe" \
+      --argjson on "$checks_on" "$jq_defs"'
+      [step(0; "save"; "setup"; $saved),
+       step(1; "tests"; "test"; "sh test_old.sh"),
+       step(2; "reach"; "check"; $reach),
+       step(3; "tunnel"; "check"; $tunnel),
+       step(4; "dead"; "check"; $dead),
+       step(5; "env_probe"; "check"; $env_probe),
+       step(6; "platform"; "check"; $platform)] as $steps
+      | {bootstrap: session($end; $sha; $steps;
+           {bootstrap: {network: $on,
+                        proxy: {user: "session:s1", runner: "RUNNERCRED", setup: "SETUPCRED"}}}),
+         credentials: ([{user: "session:s1", password: "SIGSECRET", kind: "bootstrap"},
+                        {user: "session:s1", password: "RUNNERCRED", kind: "runner"},
+                        {user: "session:s1", password: "SETUPCRED", kind: "setup", until: "ready"}]
+                       + (if $on then [{user: "session:s1", password: "CHECKSCRED", kind: "checks", from: "ready"}] else [] end)),
+         ready_answer: (if $on then {proxy: {checks: "CHECKSCRED"}} else {} end),
+         next: [{status: 200, job: job(1; (if $on then $steps[2:] else $steps[2:6] end); [])}]}' >"$scenario"
+    run_session "$tag" "$tmp" "$port" "$scenario" "$results" -e "VERIFIER_PROXY_URL=http://127.0.0.1:$pport"
+    kill "$proxy_pid" "$allowed_pid" 2>/dev/null || true
+    proxy_pid=""
+    allowed_pid=""
+
+    expect_all_pass "$results/ready.json" "the boot with the network $network (the setup secret reaches the allowed host)"
+    expect_status "$results/result-1.json" dead pass "the setup secret saved by a setup command, network $network"
+    expect_status "$results/result-1.json" env_probe pass "the job environment, network $network"
+    if [ "$network" = on ]; then
+      expect_status "$results/result-1.json" reach pass "a job command reaching an allowed host, network on"
+      expect_status "$results/result-1.json" tunnel pass "a job command tunnelling to an allowed host, network on"
+      expect_status "$results/result-1.json" platform pass "a job command reaching the platform host, network on"
+      jq -e -s '[.[] | select(.kind == "checks" and .allowed == true and .host == ("allowed.test:'"$aport"'"))] | length >= 2' "$results/proxy.jsonl" >/dev/null || {
+        cat "$results/proxy.jsonl" >&2
+        fail "the proxy did not admit the checks secret to the allowed host"
+      }
+    else
+      expect_status "$results/result-1.json" reach fail "a job command reaching an allowed host, network off"
+      expect_status "$results/result-1.json" tunnel fail "a job command tunnelling to an allowed host, network off"
+      if jq -e -s '[.[] | select(.kind == "checks")] | length > 0' "$results/proxy.jsonl" >/dev/null; then
+        cat "$results/proxy.jsonl" >&2
+        fail "the proxy saw a checks secret with the network off"
+      fi
+    fi
+    jq -e -s '[.[] | select(.kind == "setup" and .allowed == true)] | length >= 1' "$results/proxy.jsonl" >/dev/null || fail "the setup secret never reached the allowed host"
+    jq -e -s '[.[] | select(.allowed == false and .host == ("allowed.test:'"$aport"'"))] | length >= 1' "$results/proxy.jsonl" >/dev/null || fail "the saved setup secret was not refused after the ready report"
+    jq -e -s '[.[] | select(.kind == "bootstrap")] | length == 1' "$results/proxy.jsonl" >/dev/null || fail "the bootstrap did not go through the proxy on the URL's signature"
+  done
+}
+
 for runtime in "${runtimes[@]}"; do
   echo "== $runtime"
   tag="verifier-contract-$runtime:local"
@@ -94,7 +365,7 @@ for runtime in "${runtimes[@]}"; do
   fi
 
   tmp=$(mktemp -d)
-  trap '[ -z "${server_pid:-}" ] || kill "$server_pid" 2>/dev/null || true; docker run --rm -v "$tmp:/t" busybox sh -c "rm -rf /t/* /t/.[!.]*" >/dev/null 2>&1 || true; rmdir "$tmp" 2>/dev/null || true' EXIT
+  trap cleanup EXIT
 
   origin="$tmp/origin"
   mkdir -p "$origin"
@@ -103,6 +374,9 @@ for runtime in "${runtimes[@]}"; do
   # The repository's own attributes: the filter named here is defined (or not) by what a
   # command writes into .git/config, which is how a blocking git operation is planted.
   printf 'test_old.sh filter=slow\n' >"$origin/.gitattributes"
+  # A tracked file a session job can edit, and a cache directory setup fills that git ignores.
+  printf 'original\n' >"$origin/README"
+  printf 'cache/\n' >"$origin/.gitignore"
   git -C "$origin" init -q -b main
   git -C "$origin" add -A
   git -C "$origin" -c user.email=t@t -c user.name=t commit -q -m base
@@ -319,6 +593,9 @@ sleep 0.5'
     jq . "$tmp/result.json" >&2
     fail "a sandbox user whose primary group is 0 was not refused"
   }
+
+  session_cases "$tag" "$tmp" "$sha"
+  network_cases "$tag" "$tmp" "$sha"
 
   echo "ok: $runtime"
 done
