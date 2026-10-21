@@ -13,7 +13,7 @@ def digest_of(ref):
     return hashlib.sha256(ref.encode()).hexdigest()[:64]
 
 
-@requires_tools("bash", "sha256sum", "cut")
+@requires_tools("bash", "sha256sum", "cut", "jq")
 class RefreshBasesTest(TempDirCase):
     script = VERIFIER / "refresh-bases.sh"
 
@@ -62,6 +62,45 @@ class RefreshBasesTest(TempDirCase):
         self.assertNotEqual(status, 0)
         self.assertIn("could not resolve", output)
         self.assertEqual(dockerfile.read_text(), "FROM node:24@sha256:%s\n" % old)
+
+    # A buildx that prints its default listing whatever --format asks (the CI runner's, the weekly
+    # rebuild of 2026-10-19) and the manifest's own bytes for --raw.
+    LISTING_FAKE = (
+        'ref="$4"\n'
+        'if [ "$5" = --raw ]; then\n'
+        "  %s\n"
+        "else\n"
+        "  printf 'Name:      docker.io/library/%%s\\nMediaType: application/vnd.oci.image.index.v1+json\\n' \"$ref\"\n"
+        "fi\n"
+    )
+    INDEX = '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+
+    def test_a_buildx_that_ignores_format_is_answered_from_the_manifest_bytes(self):
+        write_executable(
+            self.dir / "docker",
+            self.LISTING_FAKE % ("printf '%s' '" + self.INDEX + "'"),
+        )
+        old = "2" * 64
+        dockerfile = self.dir / "Dockerfile"
+        dockerfile.write_text("FROM node:24-trixie-slim@sha256:%s\n" % old)
+
+        output, status = run(["bash", self.script, dockerfile], env=self.path_env())
+        self.assertEqual(status, 0, output)
+        expected = hashlib.sha256(self.INDEX.encode()).hexdigest()
+        self.assertEqual(dockerfile.read_text(), "FROM node:24-trixie-slim@sha256:%s\n" % expected)
+
+    def test_raw_bytes_that_are_not_a_manifest_are_never_hashed_into_a_digest(self):
+        for raw in ("echo 'manifest unknown'", "printf '%s' '{\"schemaVersion\":1}'", "exit 1"):
+            with self.subTest(raw=raw):
+                write_executable(self.dir / "docker", self.LISTING_FAKE % raw)
+                old = "3" * 64
+                dockerfile = self.dir / "Dockerfile"
+                dockerfile.write_text("FROM node:24@sha256:%s\n" % old)
+
+                output, status = run(["bash", self.script, dockerfile], env=self.path_env())
+                self.assertNotEqual(status, 0)
+                self.assertIn("could not resolve", output)
+                self.assertEqual(dockerfile.read_text(), "FROM node:24@sha256:%s\n" % old)
 
     def test_needs_a_file(self):
         output, status = run(["bash", self.script])
