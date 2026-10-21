@@ -294,9 +294,11 @@ platform) keeps the version 2 behaviour: every command gets the proxy variables.
 A session is one container start that serves several jobs for one fix. The platform runs the
 repository's own commands for the fix agent while it works (`run_checks`): the fix is staged
 in a job, the runner restores the tree, writes the job's files and runs the named commands.
-The runner holds only the profile's commands: every job names commands by `index` in the
-session's snapshot, never by text of its own, and a job that names an index the snapshot does
-not hold, or a kind it does not hold for that index, is refused. This amends "one run" above:
+The runner holds only the profile's commands: every job names commands by `index` and `kind` in
+the session's snapshot, and the text the runner executes is the snapshot's, never a job's. A job
+that names an index the snapshot does not hold, or a kind it does not hold for that index, is
+refused; so is a job step that carries a `cmd` that is not the snapshot's text with the
+placeholders below expanded. This amends "one run" above:
 a session task serves one run of one organization and one repository, several jobs, and never
 another run.
 
@@ -361,11 +363,14 @@ exits `0`.
    either. A job it cannot report (no `seq`, no `result_url`, a `seq` not after the last one
    answered) is skipped and treated like a failed request.
 4. **A job** is `{"seq": 3, "files": [{"path", "content", "test"}], "steps": [{"index",
-   "kind", "cmd"}], "result_url": "one-time PUT"}`, `cmd` already expanded by the platform.
-   Under the job clock (`job_seconds`, and never past `end_at`) the runner:
-   * checks the job: at most 20 files, at most 12 steps, every step an `index` and `kind` of
-     the snapshot, `kind` one of `check`, `analysis`, `test`, `new_test` (`setup` is never
-     rerun). A refusal is a result with no steps and a `runner_error`, and the session goes on;
+   "kind", "cmd"}], "result_url": "one-time PUT"}`. `cmd` is optional; when a step carries it, it
+   must be exactly the text the runner computes (below). Under the job clock (`job_seconds`, and
+   never past `end_at`) the runner:
+   * checks the job: at most 20 files (no path with a line break), at most 12 steps, every step an
+     `index` and `kind` of the snapshot, `kind` one of `check`, `analysis`, `test`, `new_test`
+     (`setup` is never rerun), and every `cmd` a string equal to the expansion of the snapshot's
+     command. A refusal is a result with no steps and a `runner_error`, and the session goes on;
+     the job's own text is never run, so a refusal is the only effect it can have;
    * restores the session to what the end of boot left, as the unprivileged user and with
      nothing it can write trusted (see "What the restore keeps" below): the whole git directory
      (configuration, hooks, index, objects, replace refs, alternates, grafts, `HEAD`) is put
@@ -377,10 +382,15 @@ exits `0`.
      edited, committed, staged, ignored or left behind;
    * writes the job's files with the same path rules as a patch (no absolute path, no `..`,
      no `.git`, no symbolic link on the way);
-   * runs the job's steps in kind order `check`, `analysis`, `test`, `new_test`, each as every
-     command runs (unprivileged user, own session, rebuilt environment, ended with everything
-     it started). The step is reported under the snapshot's `name` for that `index`, with the
-     `index`; `analysis` steps expand `{rules_dir}` as in a run;
+   * runs the job's steps in kind order `check`, `analysis`, `test`, `new_test` (in the job's
+     order within a kind), each as every command runs (unprivileged user, own session, rebuilt
+     environment, ended with everything it started). The text is the snapshot's command with
+     `{touched_files}` replaced by every file of the job and `{test_files}` by the files marked
+     `test`, in the job's order, each path in single quotes with a single quote inside it
+     written `'\''` and separated by one space, and `{rule_pack}` replaced by the bootstrap's
+     `analysis.rule_pack`; a command that names a placeholder that would be empty is not run and
+     is reported `skipped`. The step is reported under the snapshot's `name` for that `index`,
+     with the `index`; `analysis` steps expand `{rules_dir}` as in a run;
    * `PUT`s the result to `result_url`: the result schema with `runner.version` `3`, steps
      by `index`, no baseline, no URL and no secret. A result answered `410` ends the runner with
      exit `0`; any other refusal with exit `1`.
@@ -532,7 +542,8 @@ untracked file, a staged file, a planted git configuration, hook and exclude fil
 ref and a job-made ignore rule gone; an ignored cache kept), and that what a job left in its
 home, `/tmp`, `/var/tmp`, `/dev/shm` and in SysV shared memory is gone while what setup left
 there unchanged stays; that the job clock holds against a command that ignores `SIGTERM`; that
-`setup` never reruns and that a job naming an index outside the snapshot is refused; that the
+`setup` never reruns and that a job naming an index outside the snapshot, or carrying a command text
+that is not the snapshot's, is refused and its text never runs; that the
 runner exits on `410` and when idle; that no URL or secret is on any command line (a scanner
 running as root for the whole run looks) or in a command's environment; and, through a local
 proxy that admits only the secrets the platform lists as live, that a job command opening a

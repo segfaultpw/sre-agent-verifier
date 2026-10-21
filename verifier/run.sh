@@ -973,13 +973,81 @@ snapshot_name() {
   REPLY=$(jq -r --argjson i "$1" '.[] | select(.index == $i) | .name' "$OUT/snapshot.json")
 }
 
+# quote_path PATH: PATH in single quotes, a single quote inside it written '\'' , in REPLY.
+quote_path() {
+  local quote="'"
+  REPLY="'${1//"$quote"/"$quote\\$quote$quote"}'"
+}
+
+# What a job may run is the session's own command text, never the job's. A job step names a
+# command by `index` and `kind`; the text that runs is that command's text in the snapshot (the
+# profile's commands as the bootstrap gave them) with these placeholders replaced, from the
+# job's own files:
+#   {touched_files}  every file of the job, in the job's order, each in single quotes;
+#   {test_files}     the files the job marks `test`, the same way;
+#   {rule_pack}      the version of the bootstrap's rule pack.
+# A command that names a placeholder that would be empty is not run (it is reported skipped).
+# {rules_dir} is expanded where an analysis command is run. A job step that also carries a `cmd`
+# must carry exactly this text: anything else is a job the platform and the runner disagree on,
+# refused like a command outside the snapshot, and the job's text never runs either way.
+RULE_PACK=""
+JS_KIND=()
+JS_INDEX=()
+JS_CMD=()
+JS_SKIP=()
+
+# resolve_job_steps: fills the JS_ arrays from the job; answers 1 when a step's `cmd` is not the
+# expansion of its snapshot command.
+resolve_job_steps() {
+  local touched="" tests="" line is_test path n i index kind template given skip text
+  JS_KIND=() JS_INDEX=() JS_CMD=() JS_SKIP=()
+  while IFS= read -r line; do
+    is_test=${line:0:1}
+    path=${line:1}
+    quote_path "$path"
+    touched+="${touched:+ }$REPLY"
+    if [ "$is_test" = t ]; then tests+="${tests:+ }$REPLY"; fi
+  done < <(jq -r '.files[] | (if .test == true then "t" else "f" end) + .path' "$JOB_FILE")
+  n=$(jq '.steps | length' "$JOB_FILE")
+  for ((i = 0; i < n; i++)); do
+    index=$(jq -r ".steps[$i].index" "$JOB_FILE")
+    kind=$(jq -r ".steps[$i].kind" "$JOB_FILE")
+    template=$(jq -r --argjson i "$index" '[.[] | select(.index == $i)][0].cmd' "$OUT/snapshot.json")
+    skip=no
+    text=$template
+    case "$text" in
+      *'{touched_files}'*)
+        if [ -z "$touched" ]; then skip=yes; else text=${text//'{touched_files}'/"$touched"}; fi
+        ;;
+    esac
+    case "$text" in
+      *'{test_files}'*)
+        if [ -z "$tests" ]; then skip=yes; else text=${text//'{test_files}'/"$tests"}; fi
+        ;;
+    esac
+    if [ -n "$RULE_PACK" ]; then text=${text//'{rule_pack}'/"$RULE_PACK"}; fi
+    if [ "$(jq ".steps[$i].cmd == null" "$JOB_FILE")" != true ] && [ "$skip" = no ]; then
+      given=$(jq -r ".steps[$i].cmd" "$JOB_FILE")
+      if [ "$given" != "$text" ]; then return 1; fi
+    fi
+    JS_KIND+=("$kind")
+    JS_INDEX+=("$index")
+    JS_CMD+=("$text")
+    JS_SKIP+=("$skip")
+  done
+}
+
 # job_run SEQ: restores the tree, writes the job's files and runs its steps in kind order.
 # Records into STEPS_FILE; a refusal is left in RUNNER_ERROR, and END_SESSION is set when the
 # tree can no longer be trusted or the clock ended the job.
 job_run() {
-  local rc kind entry index name cmd
+  local rc kind i index name cmd
   if ! jq -e '(.files | type == "array") and all(.files[]; (.path | type == "string") and (.content | type == "string"))' "$JOB_FILE" >/dev/null 2>&1; then
     RUNNER_ERROR="the job's files are not a list of paths and contents"
+    return
+  fi
+  if ! jq -e 'all(.files[]; .path | test("[\\n\\r]") | not)' "$JOB_FILE" >/dev/null 2>&1; then
+    RUNNER_ERROR="the job names a path the runner refuses"
     return
   fi
   if [ "$(jq '.files | length' "$JOB_FILE")" -gt 20 ]; then
@@ -988,8 +1056,13 @@ job_run() {
   fi
   if ! jq -e --slurpfile snap "$OUT/snapshot.json" '
       (.steps | type == "array" and length <= 12) and
-      all(.steps[]; (type == "object") and (.kind | IN("check", "analysis", "test", "new_test")) and (.cmd | type == "string")
+      all(.steps[]; (type == "object") and (.kind | IN("check", "analysis", "test", "new_test"))
+        and (.cmd == null or (.cmd | type == "string"))
         and (. as $s | any($snap[0][]; .index == $s.index and .kind == $s.kind)))' "$JOB_FILE" >/dev/null 2>&1; then
+    RUNNER_ERROR="the job names a command that is not in the session's snapshot"
+    return
+  fi
+  if ! resolve_job_steps; then
     RUNNER_ERROR="the job names a command that is not in the session's snapshot"
     return
   fi
@@ -1021,19 +1094,22 @@ job_run() {
   fi
 
   for kind in check analysis test new_test; do
-    while IFS= read -r entry; do
-      [ -n "$entry" ] || continue
-      index=$(jq -r '.index' <<<"$entry")
-      cmd=$(jq -r '.cmd' <<<"$entry")
+    for ((i = 0; i < ${#JS_KIND[@]}; i++)); do
+      [ "${JS_KIND[$i]}" = "$kind" ] || continue
+      index=${JS_INDEX[$i]}
+      cmd=${JS_CMD[$i]}
       snapshot_name "$index"
       name=$REPLY
-      if [ "$kind" = analysis ]; then
+      if [ "${JS_SKIP[$i]}" = yes ]; then
+        LAST_STATUS=skipped
+        record "$name" skipped 0 "the command names files this job does not have, so it was not run" "" "$index"
+      elif [ "$kind" = analysis ]; then
         run_analysis_step "$name" "$index" "$cmd"
       else
         run_step "$name" "$cmd" "$index"
       fi
       if [ "$LAST_STATUS" = timeout ]; then END_SESSION=true; fi
-    done < <(jq -c --arg k "$kind" '.steps[] | select(.kind == $k)' "$JOB_FILE")
+    done
   done
 }
 
@@ -1195,6 +1271,8 @@ session_main() {
   NETWORK=$(jq -r 'if .network == true then "true" else "false" end' "$BOOTSTRAP_FILE")
   json_string "$BOOTSTRAP_FILE" '.session.setup_done_url'
   SETUP_DONE_URL=$REPLY
+  json_string "$BOOTSTRAP_FILE" '.analysis.rule_pack'
+  if [[ "$REPLY" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then RULE_PACK=$REPLY; fi
   if [ -n "$PROXY_USER" ] && [ -z "$SETUP_DONE_URL" ]; then
     # Without the message the platform cannot revoke the `setup` credential before the baseline.
     fail_ready "the session bootstrap carries proxy credentials and no setup_done_url"

@@ -38,8 +38,11 @@ when one is retired, which one to move to.
 Since runner version 3 the same image can also run as a **session**: one container start
 and one clone that run your repository's configured commands for several jobs while SRE
 Agent's fix agent works on a fix, until SRE Agent ends the session. Before each job the
-runner puts the tree back to the base commit (your ignored caches survive), a job can only
-name commands from the list the session started with, and a command that runs past its job
+runner puts the git directory, the tree and the unprivileged user's home and temporary
+directories back to what the end of setup left (the paths setup left ignored, such as your
+dependency caches, survive, and so does what a job writes inside them; the contract lists
+exactly what persists), a job can only name commands from the list the session started with
+and the runner runs that list's text, never a job's own, and a command that runs past its job
 clock is ended, with everything it started. After setup, commands reach no network unless the
 repository's setting allows it; on the hosted verifier that is enforced by an egress proxy
 and per-run secrets the platform revokes, on your own verifier your network rules decide.

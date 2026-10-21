@@ -29,7 +29,8 @@
 #     job left in the places outside the tree (its home, /tmp, /var/tmp, /dev/shm, a SysV shared
 #     memory segment), while what setup left there unchanged stays;
 #   * the job clock holds against a command that ignores SIGTERM and starts a daemon;
-#   * `setup` never reruns, a job naming an index outside the snapshot is refused, the
+#   * `setup` never reruns, a job naming an index outside the snapshot, or carrying a command
+#     text that is not the snapshot's, is refused (and the text never runs), the
 #     runner exits on `410` and when idle, and no URL or secret is on any command line
 #     (a scanner running as root for the whole run looks) or in a command's environment;
 #   * the network rule, through a local proxy that admits only the secrets the platform
@@ -199,25 +200,33 @@ session_cases() {
      step(7; "proc_probe"; "check"; $proc),
      step(8; "dir_probe"; "check"; $dirp),
      step(9; "count"; "check"; "test \"$(grep -c run cache/setup-runs)\" = 1"),
-     step(10; "owner"; "check"; "test \"$(stat -c %u test_new.sh)\" = \"$(id -u)\"")] as $steps
+     step(10; "owner"; "check"; "test \"$(stat -c %u test_new.sh)\" = \"$(id -u)\""),
+     step(11; "noghost"; "check"; "! test -e ghost_from_text")] as $steps
     | {bootstrap: session($end; $sha; $steps; {}),
        next: [{status: 200, job: job(1; [$steps[2], $steps[3]]; [{path: "calc.sh", content: "echo 4\n", test: false}])},
               {status: 200, job: job(2; $steps[4:]; [{path: "test_new.sh", content: "true\n", test: true}])},
               {status: 200, job: job(3; [step(0; "deps"; "setup"; "echo run >> cache/setup-runs")]; [])},
-              {status: 200, job: job(4; [$steps[9]]; [])}]}' >"$scenario"
+              {status: 200, job: job(4; [$steps[9]]; [])},
+              {status: 200, job: job(5; [step(9; "count"; "check"; "touch ghost_from_text")]; [])},
+              {status: 200, job: job(6; [$steps[11]]; [])}]}' >"$scenario"
   run_session "$tag" "$tmp" "$port" "$scenario" "$results"
   expect_all_pass "$results/ready.json" "the session boot"
   jq -e '.baseline_green == true and .runner.version == 3' "$results/ready.json" >/dev/null || fail "the ready report is not green, version 3"
   expect_all_pass "$results/result-1.json" "job 1"
   expect_all_pass "$results/result-2.json" "job 2 (a daemon from job 1 dead, the tree restored as the base commit)"
   expect_all_pass "$results/result-4.json" "job 4 (setup did not rerun)"
+  jq -e '.steps == [] and (.runner_error | test("snapshot"))' "$results/result-5.json" >/dev/null || {
+    jq . "$results/result-5.json" >&2
+    fail "a job carrying a command text of its own was not refused"
+  }
+  expect_all_pass "$results/result-6.json" "job 6 (the text of job 5 never ran)"
   jq -e '.steps == [] and (.runner_error | test("snapshot"))' "$results/result-3.json" >/dev/null || {
     jq . "$results/result-3.json" >&2
     fail "a job naming a setup command was not refused"
   }
-  jq -e '[.[] | select(.path != null and (.path | endswith("/next")))] | length == 5' <(jq -s . "$results/events.jsonl") >/dev/null || {
+  jq -e '[.[] | select(.path != null and (.path | endswith("/next")))] | length == 7' <(jq -s . "$results/events.jsonl") >/dev/null || {
     jq -s . "$results/events.jsonl" >&2
-    fail "the runner did not ask for the next job four times and stop at the 410"
+    fail "the runner did not ask for the next job six times and stop at the 410"
   }
   if grep -q 'ghs_contract_read_only_token\|leak-aws\|127.0.0.1\|SIGSECRET' "$results/ready.json" "$results"/result-*.json; then
     fail "a secret or a URL leaked into a report"
