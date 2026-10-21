@@ -3,7 +3,7 @@
 # verifier/ directory as the context:
 #   docker build -f verifier/images/node/Dockerfile verifier/
 # The base is pinned by the digest of the multi-arch index (amd64 and arm64).
-FROM node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66
+FROM node:24-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

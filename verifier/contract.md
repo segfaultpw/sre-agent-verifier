@@ -657,7 +657,7 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
    `--pip-source <version>=<40 hex>`, so nothing else names the version. If the new pip already
    carries a `--min` floor, delete that floor from the Dockerfile.
 2. Regenerate `pip-vendored.lock` from that commit's `vendor.txt`, with each `--min` floor applied
-   where `vendor.txt` is below it (the loop below applies urllib3 2.8.0 and msgpack 1.2.1, and
+   where `vendor.txt` is below it (the loop below applies urllib3 2.8.0, msgpack 1.2.1 and certifi 2026.10.19, and
    builds msgpack from its sdist, as the Dockerfile says), keeping the comment header:
 
    ```bash
@@ -665,7 +665,7 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
    SHA=<the commit from step 1>
    SDISTS="msgpack"   # the Dockerfile's --build-from-sdist names
    curl -sf "https://raw.githubusercontent.com/pypa/pip/$SHA/src/pip/_vendor/vendor.txt" |
-     sed -E 's/^(\s*)urllib3==.*/\1urllib3==2.8.0/; s/^msgpack==.*/msgpack==1.2.1/' > /tmp/vendor.txt
+     sed -E 's/^(\s*)urllib3==.*/\1urllib3==2.8.0/; s/^msgpack==.*/msgpack==1.2.1/; s/^(\s*)certifi==.*/\1certifi==2026.10.19/' > /tmp/vendor.txt
    { grep '^#' pip-vendored.lock
      sed -nE 's/^[[:space:]]*([A-Za-z0-9._-]+)==([^[:space:]#]+).*/\1 \2/p' /tmp/vendor.txt |
      while read -r name version; do

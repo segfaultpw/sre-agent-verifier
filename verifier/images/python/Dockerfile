@@ -2,7 +2,7 @@
 # Verifier image: Python. Build with the verifier/ directory as the context:
 #   docker build -f verifier/images/python/Dockerfile verifier/
 # The base is pinned by the digest of the multi-arch index (amd64 and arm64).
-FROM python:3.14-slim-trixie@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
+FROM python:3.14-slim-trixie@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -25,6 +25,7 @@ RUN --mount=type=bind,source=images/python,target=/tmp/pip-fix \
       --pip-source 26.2.1=634a6ec1a5d9dcc2433571cdb2f4c58a4bb29caf \
       --min urllib3==2.8.0 \
       --min msgpack==1.2.1 \
+      --min certifi==2026.10.19 \
       --build-from-sdist msgpack
 
 # No directory the unprivileged user can write may be one root executes from or has on its PATH

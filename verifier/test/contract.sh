@@ -46,7 +46,7 @@
 #     is refused once setup is done (for the baseline, which runs right after setup, as
 #     for every later command), and no secret is in a job command's environment.
 #
-# The go image also has a toolchain floor: Go 1.26.9 or later (the release that fixes the
+# The go image also has a toolchain floor: Go 1.26.10 or later (the release that fixes the
 # standard library advisories the scan reported), checked with `go version` in the image.
 #
 # Needs docker, git, jq and python3. No network beyond the image build.
@@ -415,13 +415,12 @@ trust_cases() {
     "printf '#!/bin/sh\\n' >/tmp/planted && chmod 0755 /tmp/planted && ln -sf /tmp/planted /usr/local/bin/wc"; do
     out=$(docker run --rm --network host -e BOOTSTRAP_URL=http://127.0.0.1:1/bootstrap --entrypoint /bin/sh "$tag" \
       -c "$breakage; /usr/local/bin/verifier-run; echo status=\$?" 2>&1) || true
-    case "$out" in
-      *"refusing to run"*"status=2"*) ;;
-      *)
-        printf '%s\n' "$out" >&2
-        fail "the runner started although: $breakage"
-        ;;
-    esac
+    # stdout and stderr reach `docker run` as two streams, so the refusal (stderr) and the
+    # status line (stdout) can arrive in either order; each is looked for on its own.
+    if [[ "$out" != *"refusing to run"* ]] || [[ "$out" != *"status=2"* ]]; then
+      printf '%s\n' "$out" >&2
+      fail "the runner started although: $breakage"
+    fi
   done
 }
 
@@ -448,8 +447,8 @@ for runtime in "${runtimes[@]}"; do
     [ -n "$go_release" ] || fail "could not read a Go release from: $go_version"
     go_minor=$(cut -d. -f2 <<<"$go_release")
     go_patch=$(cut -d. -f3 <<<"$go_release")
-    if [ "$go_minor" -lt 26 ] || { [ "$go_minor" -eq 26 ] && [ "${go_patch:-0}" -lt 9 ]; }; then
-      fail "the go image has go$go_release, below the go1.26.9 floor"
+    if [ "$go_minor" -lt 26 ] || { [ "$go_minor" -eq 26 ] && [ "${go_patch:-0}" -lt 10 ]; }; then
+      fail "the go image has go$go_release, below the go1.26.10 floor"
     fi
   fi
 

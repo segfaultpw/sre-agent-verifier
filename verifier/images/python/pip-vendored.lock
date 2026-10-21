@@ -1,5 +1,5 @@
 # The libraries the pip pinned in the Dockerfile (--pip-source) bundles in pip/_vendor (its
-# vendor.txt at that commit) with the floors the Dockerfile raises applied: urllib3 and msgpack.
+# vendor.txt at that commit) with the floors the Dockerfile raises applied: urllib3, msgpack and certifi.
 # fix-pip-vendored.sh downloads exactly these, with --require-hashes, into a wheelhouse and
 # runs the vendoring sync against that wheelhouse alone. Each pin lists only the files the
 # sync may use: the pure-Python wheel, or for msgpack (which has none) the sdist it is built
@@ -23,8 +23,8 @@ pyproject-hooks==1.2.0 \
     --hash=sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
-certifi==2026.6.17 \
-    --hash=sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db
+certifi==2026.10.19 \
+    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
 idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
 urllib3==2.8.0 \

@@ -142,7 +142,7 @@ class EachImageTest(unittest.TestCase):
 class PinnedToolchainTest(unittest.TestCase):
     def test_the_go_image_follows_the_floating_tag_of_a_go_line_from_1_26_on(self):
         # A patch tag such as 1.26.9-trixie stops being re-pointed once the next patch ships, so
-        # the weekly refresh could never move it; the 1.26.9 floor is checked on the built image
+        # the weekly refresh could never move it; the 1.26.10 floor is checked on the built image
         # by verifier/test/contract.sh instead.
         froms = [FROM_LINE.match(l) for l in dockerfile("go").split("\n") if l.startswith("FROM ")]
         (ref,) = [m.group(1) for m in froms]

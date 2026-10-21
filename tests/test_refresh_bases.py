@@ -170,8 +170,9 @@ class ContractScriptGoToolchainFloorTest(TempDirCase):
             env={"PATH": "%s:%s" % (self.dir, os.environ["PATH"]), "GO_VERSION_LINE": version_line},
         )
 
-    def test_refuses_a_go_image_older_than_1_26_9(self):
+    def test_refuses_a_go_image_older_than_1_26_10(self):
         for line, release in [
+            ("go version go1.26.9 linux/amd64", "go1.26.9"),
             ("go version go1.26.8 linux/amd64", "go1.26.8"),
             ("go version go1.26 linux/amd64", "go1.26"),
             ("go version go1.25.12 linux/arm64", "go1.25.12"),
@@ -179,13 +180,13 @@ class ContractScriptGoToolchainFloorTest(TempDirCase):
             with self.subTest(line=line):
                 output, status = self.contract_for_go(line)
                 self.assertNotEqual(status, 0)
-                self.assertIn("FAIL: the go image has %s, below the go1.26.9 floor" % release, output)
+                self.assertIn("FAIL: the go image has %s, below the go1.26.10 floor" % release, output)
                 self.assertNotIn("the runner exited non-zero", output)
 
-    def test_accepts_go_1_26_9_and_later_and_goes_on_to_the_contract(self):
+    def test_accepts_go_1_26_10_and_later_and_goes_on_to_the_contract(self):
         for line in [
-            "go version go1.26.9 linux/amd64",
             "go version go1.26.10 linux/arm64",
+            "go version go1.26.11 linux/amd64",
             "go version go1.27.0 linux/amd64",
             "go version go1.27 linux/amd64",
         ]:
