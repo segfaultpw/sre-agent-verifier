@@ -108,6 +108,63 @@ class SessionCommandsTest(SessionCase):
         self.assertFalse(self.repo("tests.txt").exists())
         self.assertEqual(self.repo("touched.txt").read_text(), "a.txt\n")
 
+    def test_awkward_paths_reach_the_command_as_one_quoted_argument_each(self):
+        names = ["a b.ts", "$(touch pwned).ts", "x;id.ts", "*.ts", "`touch pwned2`.ts", 'q"d.ts', "back\\slash.ts", "-n.ts"]
+        files = [(n, "x\n", n != "a b.ts") for n in names] + [("other.ts", "y\n", True)]
+        touched = step(4, "touched", "analysis", "printf '%s\\n' {touched_files} > touched.txt")
+        tests = step(5, "tests_only", "new_test", "printf '%s\\n' {test_files} > tests.txt")
+        self.run_jobs([job(1, [bare(4, "analysis"), bare(5, "new_test")], files)], steps=[SETUP, UNIT, LINT, MARK, touched, tests])
+        self.assertAllPass(self.result(1))
+        self.assertEqual(self.repo("touched.txt").read_text().split("\n")[:-1], names + ["other.ts"])
+        self.assertEqual(
+            self.repo("tests.txt").read_text().split("\n")[:-1], [n for n in names if n != "a b.ts"] + ["other.ts"]
+        )
+        self.assertFalse(self.repo("pwned").exists())
+        self.assertFalse(self.repo("pwned2").exists())
+
+    def test_a_path_with_a_brace_or_a_line_break_is_refused_so_no_placeholder_is_expanded_twice(self):
+        both = step(6, "both", "analysis", "printf '%s\\n' {touched_files} {test_files} > both.txt")
+        bad = [
+            [("{test_files}.ts", "x\n", False), ("$(touch pwned).ts", "y\n", True)],
+            [("{rules_dir}.ts", "x\n", False)],
+            [("{touched_files}", "x\n", False)],
+            [("a}b.ts", "x\n", False)],
+            [("a{b.ts", "x\n", False)],
+            [("a\nb.ts", "x\n", False)],
+            [("a\rb.ts", "x\n", False)],
+        ]
+        jobs = [job(n, [bare(6, "analysis")], files) for n, files in enumerate(bad, 1)]
+        jobs.append(job(len(bad) + 1, [LINT]))
+        self.run_jobs(jobs, steps=BASE + [both])
+        for n in range(1, len(bad) + 1):
+            result = self.result(n)
+            self.assertEqual(result["steps"], [], n)
+            self.assertIn("path", result["runner_error"], n)
+        self.assertAllPass(self.result(len(bad) + 1))
+        self.assertFalse(self.repo("pwned").exists())
+        self.assertFalse(self.repo("both.txt").exists())
+
+    def test_a_run_whose_patch_names_a_path_with_a_brace_is_refused(self):
+        scenario = {
+            "bootstrap": {
+                "repo_url": self.repo_url(),
+                "repo_token": "ghs_run_token",
+                "base_sha": self.sha,
+                "result_url": "http://127.0.0.1:@PORT@/result",
+                "wall_clock_seconds": 300,
+                "max_output_bytes": 100000,
+                "steps": [step(0, "unit", "test", "sh test_old.sh"), step(1, "scan", "analysis", "echo {rules_dir}")],
+                "files": [{"path": "{rules_dir}.txt", "content": "x\n", "test": False}],
+            }
+        }
+        from session_support import RUN_PATH
+
+        platform, done = self.run_scenario(scenario, path=RUN_PATH)
+        self.assertRunnerOk(done)
+        result = platform.body("result.json")
+        self.assertIn("path", result["runner_error"])
+        self.assertEqual(self.status_of(result, "scan"), [])
+
     def test_rules_dir_is_still_the_runners_to_expand(self):
         rules = step(6, "rules", "analysis", "grep -q sre-x {rules_dir}/a.yml")
         scenario = self.session_scenario(

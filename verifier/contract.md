@@ -127,7 +127,7 @@ Command names are `[a-z][a-z0-9_]{0,39}` and never `baseline`, `new_test_fails_b
    unprivileged user and moved into place with one rename: root never writes inside a
    directory that user can write. Step `clone`.
 4. Checks every path in the patch again (no absolute path, no `..`, no `.git`, no doubled
-   or trailing separator, no symbolic link on the way), because the runner decides where it
+   or trailing separator, no `{` or `}`, no line break, no symbolic link on the way), because the runner decides where it
    is written. At most 20 files. Every write to the tree from here on (the patch, taking it
    back) is made by the unprivileged user, from a copy of the content that only root can
    write, and every git command the runner runs on the tree (`git ls-files` to learn whether
@@ -366,7 +366,8 @@ exits `0`.
    "kind", "cmd"}], "result_url": "one-time PUT"}`. `cmd` is optional; when a step carries it, it
    must be exactly the text the runner computes (below). Under the job clock (`job_seconds`, and
    never past `end_at`) the runner:
-   * checks the job: at most 20 files (no path with a line break), at most 12 steps, every step an
+   * checks the job: at most 20 files (no path with a line break, `{` or `}`: a brace could spell a
+     placeholder), at most 12 steps, every step an
      `index` and `kind` of the snapshot, `kind` one of `check`, `analysis`, `test`, `new_test`
      (`setup` is never rerun), and every `cmd` a string equal to the expansion of the snapshot's
      command. A refusal is a result with no steps and a `runner_error`, and the session goes on;
@@ -388,8 +389,10 @@ exits `0`.
      `{touched_files}` replaced by every file of the job and `{test_files}` by the files marked
      `test`, in the job's order, each path in single quotes with a single quote inside it
      written `'\''` and separated by one space, and `{rule_pack}` replaced by the bootstrap's
-     `analysis.rule_pack`; a command that names a placeholder that would be empty is not run and
-     is reported `skipped`. The step is reported under the snapshot's `name` for that `index`,
+     `analysis.rule_pack`; every placeholder is replaced in one pass over the snapshot's text, so
+     a replacement is never searched for placeholders again; a command that names a placeholder
+     that would be empty is not run and is reported `skipped`. Each path reaches the command as one
+     single-quoted word, whatever characters it holds (spaces, `$(...)`, `;`, `*`, quotes). The step is reported under the snapshot's `name` for that `index`,
      with the `index`; `analysis` steps expand `{rules_dir}` as in a run;
    * `PUT`s the result to `result_url`: the result schema with `runner.version` `3`, steps
      by `index`, no baseline, no URL and no secret. A result answered `410` ends the runner with

@@ -678,6 +678,8 @@ safe_path() {
   esac
   case "$path" in .git | .git/* | */.git | */.git/*) return 1 ;; esac
   case "$path" in *$'\n'* | *$'\r'*) return 1 ;; esac
+  # A brace could spell a placeholder, and nothing that reaches a command may be able to.
+  case "$path" in *'{'* | *'}'*) return 1 ;; esac
   expected="$(realpath -m "$REPO")/$path"
   actual=$(realpath -m "$REPO/$path")
   [ "$expected" = "$actual" ] || return 1
@@ -787,13 +789,82 @@ write_rules() {
   fi
 }
 
+# expand_tokens TEXT: TEXT with its placeholders replaced, in REPLY, in ONE pass over TEXT: what
+# a replacement says is never looked at again, so no value can introduce a placeholder of its
+# own. The values are XT_TOUCHED, XT_TESTS (a session job's files, already quoted), XT_PACK and
+# XT_RULES; a value that is empty leaves its placeholder as written, except that with XT_FILES
+# set a files placeholder with no files sets XT_EMPTY (the command must not run).
+XT_FILES=no
+XT_TOUCHED=""
+XT_TESTS=""
+XT_PACK=""
+XT_RULES=""
+XT_EMPTY=no
+expand_tokens() {
+  local rest=$1 out="" token
+  XT_EMPTY=no
+  while [[ "$rest" == *'{'* ]]; do
+    out+=${rest%%'{'*}
+    rest="{${rest#*'{'}"
+    case "$rest" in
+      '{touched_files}'*)
+        token='{touched_files}'
+        if [ "$XT_FILES" != yes ]; then
+          out+=$token
+        elif [ -z "$XT_TOUCHED" ]; then
+          XT_EMPTY=yes
+          out+=$token
+        else
+          out+=$XT_TOUCHED
+        fi
+        rest=${rest#"$token"}
+        ;;
+      '{test_files}'*)
+        token='{test_files}'
+        if [ "$XT_FILES" != yes ]; then
+          out+=$token
+        elif [ -z "$XT_TESTS" ]; then
+          XT_EMPTY=yes
+          out+=$token
+        else
+          out+=$XT_TESTS
+        fi
+        rest=${rest#"$token"}
+        ;;
+      '{rule_pack}'*)
+        token='{rule_pack}'
+        if [ -n "$XT_PACK" ]; then out+=$XT_PACK; else out+=$token; fi
+        rest=${rest#"$token"}
+        ;;
+      '{rules_dir}'*)
+        token='{rules_dir}'
+        if [ -n "$XT_RULES" ]; then out+=$XT_RULES; else out+=$token; fi
+        rest=${rest#"$token"}
+        ;;
+      *)
+        out+='{'
+        rest=${rest:1}
+        ;;
+    esac
+  done
+  REPLY=$out$rest
+}
+
 # Static analysis on the files the proposal touches. A finding is evidence for the person
 # reading the pull request and never a verdict, and a tool this image does not carry is
 # `skipped` (the shell's "command not found", 127), not a failure: the platform judges
 # neither, it shows them.
 run_analysis_step() {
   local name=$1 index=$2 cmd=$3
-  cmd=${cmd//\{rules_dir\}/$RULES_DIR_QUOTED}
+  XT_FILES=no XT_TOUCHED="" XT_TESTS="" XT_PACK="" XT_RULES=$RULES_DIR_QUOTED
+  expand_tokens "$cmd"
+  cmd=$REPLY
+  run_analysis_command "$name" "$index" "$cmd"
+}
+
+# run_analysis_command NAME INDEX CMD: CMD as it is, reported as an analysis step.
+run_analysis_command() {
+  local name=$1 index=$2 cmd=$3
   run_step "$name" "$cmd" "$index" no no
   if [ "$LAST_STATUS" = fail ] && [ "$LAST_RC" = 127 ]; then
     record "$name" skipped "$LAST_DURATION" "the analysis tool is not installed in this image, so nothing was analysed" "$LAST_RC" "$index"
@@ -997,9 +1068,9 @@ JS_CMD=()
 JS_SKIP=()
 
 # resolve_job_steps: fills the JS_ arrays from the job; answers 1 when a step's `cmd` is not the
-# expansion of its snapshot command.
+# expansion of its snapshot command. Each expansion is one pass over the snapshot's text.
 resolve_job_steps() {
-  local touched="" tests="" line is_test path n i index kind template given skip text
+  local touched="" tests="" line is_test path n i index kind template given text shown
   JS_KIND=() JS_INDEX=() JS_CMD=() JS_SKIP=()
   while IFS= read -r line; do
     is_test=${line:0:1}
@@ -1013,27 +1084,22 @@ resolve_job_steps() {
     index=$(jq -r ".steps[$i].index" "$JOB_FILE")
     kind=$(jq -r ".steps[$i].kind" "$JOB_FILE")
     template=$(jq -r --argjson i "$index" '[.[] | select(.index == $i)][0].cmd' "$OUT/snapshot.json")
-    skip=no
-    text=$template
-    case "$text" in
-      *'{touched_files}'*)
-        if [ -z "$touched" ]; then skip=yes; else text=${text//'{touched_files}'/"$touched"}; fi
-        ;;
-    esac
-    case "$text" in
-      *'{test_files}'*)
-        if [ -z "$tests" ]; then skip=yes; else text=${text//'{test_files}'/"$tests"}; fi
-        ;;
-    esac
-    if [ -n "$RULE_PACK" ]; then text=${text//'{rule_pack}'/"$RULE_PACK"}; fi
-    if [ "$(jq ".steps[$i].cmd == null" "$JOB_FILE")" != true ] && [ "$skip" = no ]; then
+    XT_FILES=yes XT_TOUCHED=$touched XT_TESTS=$tests XT_PACK=$RULE_PACK XT_RULES=""
+    expand_tokens "$template"
+    shown=$REPLY
+    if [ "$kind" = analysis ]; then
+      XT_RULES=$RULES_DIR_QUOTED
+      expand_tokens "$template"
+    fi
+    text=$REPLY
+    if [ "$(jq ".steps[$i].cmd == null" "$JOB_FILE")" != true ] && [ "$XT_EMPTY" = no ]; then
       given=$(jq -r ".steps[$i].cmd" "$JOB_FILE")
-      if [ "$given" != "$text" ]; then return 1; fi
+      if [ "$given" != "$shown" ]; then return 1; fi
     fi
     JS_KIND+=("$kind")
     JS_INDEX+=("$index")
     JS_CMD+=("$text")
-    JS_SKIP+=("$skip")
+    JS_SKIP+=("$XT_EMPTY")
   done
 }
 
@@ -1046,7 +1112,7 @@ job_run() {
     RUNNER_ERROR="the job's files are not a list of paths and contents"
     return
   fi
-  if ! jq -e 'all(.files[]; .path | test("[\\n\\r]") | not)' "$JOB_FILE" >/dev/null 2>&1; then
+  if ! jq -e 'all(.files[]; .path | test("[{}\\n\\r]") | not)' "$JOB_FILE" >/dev/null 2>&1; then
     RUNNER_ERROR="the job names a path the runner refuses"
     return
   fi
@@ -1104,7 +1170,7 @@ job_run() {
         LAST_STATUS=skipped
         record "$name" skipped 0 "the command names files this job does not have, so it was not run" "" "$index"
       elif [ "$kind" = analysis ]; then
-        run_analysis_step "$name" "$index" "$cmd"
+        run_analysis_command "$name" "$index" "$cmd"
       else
         run_step "$name" "$cmd" "$index"
       fi
