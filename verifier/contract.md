@@ -366,13 +366,15 @@ exits `0`.
    * checks the job: at most 20 files, at most 12 steps, every step an `index` and `kind` of
      the snapshot, `kind` one of `check`, `analysis`, `test`, `new_test` (`setup` is never
      rerun). A refusal is a result with no steps and a `runner_error`, and the session goes on;
-   * restores the tree to `base_sha` as the unprivileged user: git's own configuration, index,
-     exclude and attributes files are put back from copies taken right after the clone,
-     `HEAD` and the working tree and index are reset to `base_sha`, and every untracked file
-     and directory that is not ignored is removed (`git clean -ffd`, never `-x`: the ignored
-     caches `setup` built survive). A job therefore starts from the base commit plus its own
-     files, whatever the previous job edited, committed, staged or left behind. Ignored files
-     persist by design; the platform's final verification is a fresh clone;
+   * restores the session to what the end of boot left, as the unprivileged user and with
+     nothing it can write trusted (see "What the restore keeps" below): the whole git directory
+     (configuration, hooks, index, objects, replace refs, alternates, grafts, `HEAD`) is put
+     back from a copy taken right after the clone, the index is rebuilt and every tracked file
+     is written again from the base commit, and every untracked path is removed except the
+     paths `setup` left ignored, which the runner listed once, at ready, and matches by exact
+     name (an ignore rule, attributes file or exclude file a job wrote decides nothing). A job
+     therefore starts from the base commit plus its own files, whatever the previous job
+     edited, committed, staged, ignored or left behind;
    * writes the job's files with the same path rules as a patch (no absolute path, no `..`,
      no `.git`, no symbolic link on the way);
    * runs the job's steps in kind order `check`, `analysis`, `test`, `new_test`, each as every
@@ -390,6 +392,43 @@ exits `0`.
 
 Every URL and secret of a session lives in a mode 0600 file only root can open, like a run's.
 Nothing but the runner's own `curl` and `git` is ever handed one, and on no command line.
+
+### What the restore keeps between two jobs
+
+The restore is the only boundary between two jobs of one session, so it is stated exactly. Every
+command, `setup` included, runs as the same unprivileged user, which owns everything the restore
+reads back. Nothing a job writes is trusted: what is put back comes from copies the runner made
+as root (a copy of the git directory right after the clone, the list of ignored paths and a
+manifest of the places below, both at ready) in a directory the unprivileged user cannot write.
+
+Gone before the next job:
+
+* processes (every one the unprivileged user owns), SysV shared memory, semaphores and message
+  queues;
+* the git directory as the clone left it (a replace ref, `objects/info/alternates`,
+  `info/grafts`, a commit, a stash, a branch, a hook, a configuration entry, a forged or deleted
+  object, a `.git` that was replaced or locked);
+* every tracked path (content, mode, type), every untracked path that is not one of the ignored
+  paths below (nested repositories included), every `.gitattributes`, `.gitignore` or exclude
+  rule a job wrote;
+* in the unprivileged user's home, `TMPDIR` (`$WORK/tmp`, set for every command of a session),
+  `/tmp`, `/var/tmp` and `/dev/shm` (and the home of the sandbox user in the image): every file
+  or directory the unprivileged user owns that was not there at ready or is not exactly as it
+  was (path, type, mode, size, mtime and ctime, which a process cannot set).
+
+Kept, on purpose, because they are the dependency and build caches that make a session fast:
+
+* the paths `setup` and the baseline left ignored (`git ls-files --others --ignored
+  --exclude-standard --directory`, taken at ready, matched by exact name), **and whatever a job
+  writes inside them**: a later job reads a cache an earlier job changed. The platform's final
+  verification is a fresh clone and never reads them;
+* the files and directories in the home and temporary places above that setup or the baseline
+  left and no job changed. A file a job changed or deleted is not brought back: a changed one is
+  removed, a deleted one stays deleted (the next command refetches or rebuilds it).
+
+A place the unprivileged user can write that is none of the above persists. The images make
+none (the work directory, the rule pack and the runner's own files are root's), and a second
+mount an operator adds is the operator's to account for.
 
 ## Running it in your own account
 
@@ -489,8 +528,10 @@ ends, that no URL is on any command line, that the patch is written by the unpri
 user and that the runner's own time cap holds. For session mode it also proves, with the
 same uid separation: that a daemon a job started is dead before the next job; that the next
 job's tree is the base commit as the unprivileged user restores it (an edited tracked file, an
-untracked file, a staged file, a planted git configuration, hook and exclude file gone; an
-ignored cache kept); that the job clock holds against a command that ignores `SIGTERM`; that
+untracked file, a staged file, a planted git configuration, hook and exclude file, a replace
+ref and a job-made ignore rule gone; an ignored cache kept), and that what a job left in its
+home, `/tmp`, `/var/tmp`, `/dev/shm` and in SysV shared memory is gone while what setup left
+there unchanged stays; that the job clock holds against a command that ignores `SIGTERM`; that
 `setup` never reruns and that a job naming an index outside the snapshot is refused; that the
 runner exits on `410` and when idle; that no URL or secret is on any command line (a scanner
 running as root for the whole run looks) or in a command's environment; and, through a local

@@ -216,7 +216,7 @@ use_step_env setup
 # a home that does not exist. `-c` settings outrank the repository's own config, so
 # hooks and the file system monitor stay off whatever `.git/config` says.
 OP_ENV=("PATH=$PATH" "HOME=/nonexistent" "LANG=C.UTF-8" "GIT_TERMINAL_PROMPT=0"
-  "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_OPTIONAL_LOCKS=0")
+  "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_OPTIONAL_LOCKS=0" "GIT_NO_REPLACE_OBJECTS=1")
 if [ -n "$SANDBOX_UID" ]; then
   OP_PREFIX=(setpriv --reuid="$SANDBOX_UID" --regid="$SANDBOX_GID" --clear-groups
     --no-new-privs --bounding-set=-all --inh-caps=-all -- env -i "${OP_ENV[@]}")
@@ -278,10 +278,14 @@ reap_step() {
 # the unprivileged user, from the repository. Held to what a step is held to: its own
 # session, the time the run has left, and everything it started is ended when it
 # returns. Answers the command's status, or 124 when the run's clock ran out first.
+# OP_STDIN and OP_STDOUT name files the runner opens itself (so they are root's, whoever
+# the operation is): what the operation reads, and where its output goes.
+OP_STDIN=/dev/null
+OP_STDOUT=/dev/null
 sandbox_op() {
   local pid rc timed_out=0
   if [ "$((DEADLINE - SECONDS))" -le 0 ]; then return 124; fi
-  (cd "$REPO" && exec setsid "${OP_PREFIX[@]}" "$@" </dev/null >/dev/null 2>&1) &
+  (cd "$REPO" && exec setsid "${OP_PREFIX[@]}" "$@" <"$OP_STDIN" >"$OP_STDOUT" 2>/dev/null) &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$SECONDS" -ge "$DEADLINE" ]; then
@@ -815,35 +819,152 @@ fail_ready() {
   exit 0
 }
 
-# What git needs to be told before a job, that the previous job could have changed: its
-# own configuration (filters, hooks, fsmonitor), the exclude and attributes files that
-# decide what `clean` removes, and the index, whose assume-unchanged and skip-worktree
-# flags can hide an edit from a restore. The configuration and the exclude file come back
-# from copies taken right after the clone, held where only root can write.
+# What a job can leave behind, and how the next job is kept from meeting it. The restore is the
+# boundary between two jobs, and the unprivileged user owns everything a job touches, so the
+# restore trusts nothing that user can write and puts back from copies held where only root
+# can write (PRISTINE):
+#   the git directory   the whole of it, as it was right after the clone: configuration, hooks,
+#                       index, objects, replace refs, alternates, grafts, info files, HEAD;
+#   the tree            the base commit's files (every tracked path rewritten from that git
+#                       directory), and every untracked path removed except the ones setup left
+#                       ignored, which are listed once, at ready, and matched by exact name; a
+#                       job's own ignore rules, attributes and excludes decide nothing;
+#   the home and the    every file the unprivileged user owns in its home, TMPDIR, /tmp, /var/tmp
+#   temporary places    and /dev/shm that is not exactly as setup left it (path, type, mode,
+#                       size, mtime and ctime, which a process cannot set) is removed, and SysV
+#                       IPC objects are removed; what setup left unchanged stays (the dependency
+#                       caches), what a job deleted stays deleted.
+# What persists on purpose: the paths setup left ignored (dependency and build caches) and
+# whatever a job writes inside them; the files setup left in the places above, unchanged.
 PRISTINE="$WORK/pristine"
+TMP_DIR="$WORK/tmp"
+STATE_ROOTS=()
+
+# snapshot_git_state: the git directory as the clone left it, before the first command runs.
 snapshot_git_state() {
   install -d -m 0755 "$PRISTINE"
-  cp -- "$REPO/.git/config" "$PRISTINE/config"
-  if [ -e "$REPO/.git/info/exclude" ]; then cp -- "$REPO/.git/info/exclude" "$PRISTINE/exclude"; fi
-  chmod -R a+rX "$PRISTINE"
+  cp -a -- "$REPO/.git" "$PRISTINE/git"
+  chown -R 0:0 "$PRISTINE/git" 2>/dev/null
+  chmod -R go-w,a+rX "$PRISTINE"
 }
 
-# restore_tree: the tree as the base commit has it, as the unprivileged user and under
-# the job's clock. Answers 0, or the failing operation's status (124 for the clock).
+# state_scan OUTFILE SECONDS: one line per entry of the places a command can write outside the
+# tree, sorted. A directory is listed by path, type, mode and owner only (its times change
+# whenever an entry does); anything else also by size, mtime and ctime.
+state_scan() {
+  local out=$1 limit=$2 root uid_args=() rc
+  if [ -n "$SANDBOX_UID" ]; then uid_args=(-uid "$SANDBOX_UID"); fi
+  {
+    for root in "${STATE_ROOTS[@]}"; do
+      [ -d "$root" ] || continue
+      # Status 1 is a directory find could not enter: only possible when the runner is not
+      # root (a test), where a job can lock a directory against its own user; the directory
+      # is still listed, and the restore removes it.
+      timeout -k 5 "$limit" find -P "$root" "${uid_args[@]}" \
+        \( \( -type d -printf '%p\td\t%m\t%U\t0\t0\t0\0' \) -o -printf '%p\t%y\t%m\t%U\t%s\t%T@\t%C@\0' \) 2>/dev/null
+      rc=$?
+      if [ "$rc" -gt 1 ]; then return 1; fi
+    done
+  } | LC_ALL=C sort -z -u >"$out"
+}
+
+# write_keep_patterns LIST OUT: gitignore patterns that match exactly the paths in LIST (the
+# NUL-separated output of git ls-files), each anchored at the root of the tree.
+write_keep_patterns() {
+  local entry escaped
+  : >"$2"
+  while IFS= read -r -d '' entry; do
+    case "$entry" in *$'\n'*) continue ;; esac
+    escaped=${entry//\\/\\\\}
+    escaped=${escaped//\*/\\*}
+    escaped=${escaped//\?/\\?}
+    escaped=${escaped//\[/\\[}
+    case "$escaped" in *' ') escaped="${escaped%?}\\ " ;; esac
+    printf '/%s\n' "$escaped" >>"$2"
+  done <"$1"
+  chmod a+r "$2"
+}
+
+# record_ready_state: what setup and the baseline left, as the restore keeps it. Answers 0, or
+# the failing operation's status.
+record_ready_state() {
+  local root pw_home
+  STATE_ROOTS=("$SANDBOX_HOME" "$TMP_DIR")
+  if [ -n "$SANDBOX_UID" ]; then
+    pw_home=$(getent passwd "$SANDBOX_USER" 2>/dev/null | cut -d: -f6)
+    if [ -n "$pw_home" ] && [ "$pw_home" != "$SANDBOX_HOME" ]; then STATE_ROOTS+=("$pw_home"); fi
+    STATE_ROOTS+=(/tmp /var/tmp /dev/shm)
+  fi
+  : >"$PRISTINE/state.roots"
+  for root in "${STATE_ROOTS[@]}"; do printf '%s\n' "$root" >>"$PRISTINE/state.roots"; done
+  state_scan "$PRISTINE/state.manifest" 300 || return 1
+  OP_STDOUT="$PRISTINE/ignored.z" sandbox_op "${GIT[@]}" ls-files -z --others --ignored --exclude-standard --directory
+  local rc=$?
+  OP_STDOUT=/dev/null
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  write_keep_patterns "$PRISTINE/ignored.z" "$PRISTINE/keep.patterns"
+  chmod -R go-w,a+rX "$PRISTINE"
+}
+
+# restore_state: removes what the last job added or changed in the places outside the tree.
+restore_state() {
+  local left=$((DEADLINE - SECONDS)) rc status
+  if [ "$left" -le 0 ]; then return 124; fi
+  state_scan "$OUT/state.now" "$left" || return 1
+  comm -z -13 "$PRISTINE/state.manifest" "$OUT/state.now" |
+    sed -z -E 's/(\t[^\t]*){6}$//' |
+    grep -zvxFf "$PRISTINE/state.roots" >"$OUT/state.delete"
+  status=("${PIPESTATUS[@]}")
+  if [ "${status[0]}" -ne 0 ] || [ "${status[1]}" -ne 0 ] || [ "${status[2]}" -gt 1 ]; then return 1; fi
+  if [ -s "$OUT/state.delete" ]; then
+    OP_STDIN="$OUT/state.delete" sandbox_op xargs -0 -r sh -c 'find -P "$@" -type d -exec chmod u+rwx -- {} \; 2>/dev/null; rm -rf -- "$@"' sh
+    rc=$?
+    OP_STDIN=/dev/null
+    if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  fi
+  if [ -n "$SANDBOX_UID" ] && command -v ipcrm >/dev/null 2>&1; then
+    sandbox_op ipcrm --all
+  fi
+  return 0
+}
+
+# restore_tree: the tree as the base commit has it, as the unprivileged user and under the
+# job's clock. Answers 0, or the failing operation's status (124 for the clock).
 restore_tree() {
   local rc
-  sandbox_op sh -c 'rm -rf -- .git/config .git/index .git/info/exclude .git/info/attributes .git/info/sparse-checkout && mkdir -p .git/info && cp -- "$1" .git/config && { [ ! -e "$2" ] || cp -- "$2" .git/info/exclude; }' sh "$PRISTINE/config" "$PRISTINE/exclude"
+  restore_state
   rc=$?
   if [ "$rc" -ne 0 ]; then return "$rc"; fi
-  sandbox_op "${GIT[@]}" update-ref --no-deref HEAD "$BASE_SHA"
+  sandbox_op sh -c 'find -P .git -type d -exec chmod u+rwx -- {} \; 2>/dev/null; rm -rf -- .git && cp -R -- "$1" .git' sh "$PRISTINE/git"
   rc=$?
   if [ "$rc" -ne 0 ]; then return "$rc"; fi
-  sandbox_op "${GIT[@]}" read-tree --reset -u "$BASE_SHA"
+  # A directory the last job locked against its own user would fail every write below.
+  sandbox_op sh -c 'find -P . -path ./.git -prune -o -type d -exec chmod u+rwx -- {} \; 2>/dev/null'
   rc=$?
   if [ "$rc" -ne 0 ]; then return "$rc"; fi
-  # Untracked files and directories (nested repositories too) that are not ignored; never
-  # -x, so the ignored caches setup built survive.
-  sandbox_op "${GIT[@]}" clean -ffdq
+  # Untracked paths and directories (nested repositories too), whatever any ignore rule says,
+  # except the exact paths setup left ignored.
+  OP_STDOUT="$OUT/untracked.z" sandbox_op "${GIT[@]}" ls-files -z --others --directory "--exclude-from=$PRISTINE/keep.patterns"
+  rc=$?
+  OP_STDOUT=/dev/null
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  OP_STDIN="$OUT/untracked.z" sandbox_op xargs -0 -r rm -rf --
+  rc=$?
+  OP_STDIN=/dev/null
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  # The index is rebuilt from nothing, so no stat entry or flag (assume-unchanged,
+  # skip-worktree) can hide an edit, and every tracked file is written again.
+  sandbox_op rm -f .git/index
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  sandbox_op "${GIT[@]}" read-tree --reset -u --end-of-options "$BASE_SHA"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  OP_STDOUT="$OUT/head.txt" sandbox_op "${GIT[@]}" rev-parse HEAD
+  rc=$?
+  OP_STDOUT=/dev/null
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  [ "$(cat "$OUT/head.txt")" = "$BASE_SHA" ]
 }
 
 # snapshot_name INDEX: the name the session's snapshot gives a command, in REPLY. A job's
@@ -1093,6 +1214,15 @@ session_main() {
   if [ -n "$RUNNER_ERROR" ]; then fail_ready "$RUNNER_ERROR"; fi
   if [ -z "$REPO_URL" ]; then fail_ready "the bootstrap named no repository"; fi
 
+  # Every command of a session gets a temporary directory of its own to reach: the restore
+  # between jobs puts it back, along with the home, from the manifest taken at ready.
+  if [ -n "$SANDBOX_UID" ]; then
+    install -d -o "$SANDBOX_UID" -g "$SANDBOX_GID" -m 0700 "$TMP_DIR"
+  else
+    install -d -m 0700 "$TMP_DIR"
+  fi
+  BASE_ENV+=("TMPDIR=$TMP_DIR")
+
   # Boot: clone, setup, the baseline on the unmodified tree. One clock for all of it.
   DEADLINE=$((SECONDS + setup_seconds))
   if ! do_clone; then fail_ready "the repository could not be cloned"; fi
@@ -1132,6 +1262,10 @@ session_main() {
     run_step baseline "$(jq -r .cmd <<<"$entry")" "$(jq -r '.index // empty' <<<"$entry")"
     if [ "$LAST_STATUS" != pass ]; then BASELINE_GREEN=false; fi
   done < <(commands_of test)
+
+  if ! record_ready_state; then
+    fail_ready "the state of the tree could not be recorded for the restore between jobs"
+  fi
 
   build_result "$OUT/ready.json"
   if ! put_json "$READY_CONFIG" "$OUT/ready.json"; then

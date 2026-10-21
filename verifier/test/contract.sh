@@ -24,8 +24,10 @@
 #
 #   * a daemon a job starts is dead before the next job, and the next job's tree is the base
 #     commit (a tracked file edited, an untracked file, a staged file, a planted git
-#     configuration, hook and exclude file all gone; an ignored cache kept), restored by the
-#     unprivileged user;
+#     configuration, hook and exclude file, a replace ref, an ignore rule the job wrote itself,
+#     all gone; an ignored cache kept), restored by the unprivileged user; and so is what the
+#     job left in the places outside the tree (its home, /tmp, /var/tmp, /dev/shm, a SysV shared
+#     memory segment), while what setup left there unchanged stays;
 #   * the job clock holds against a command that ignores SIGTERM and starts a daemon;
 #   * `setup` never reruns, a job naming an index outside the snapshot is refused, the
 #     runner exits on `410` and when idle, and no URL or secret is on any command line
@@ -175,7 +177,10 @@ session_cases() {
   # starts the daemons of the run cases; job 2 sees none of it, and the cache.
   local tamper restored sprobe
   tamper='echo tampered >README && echo stray >stray.txt && echo c >cache/job1-cache && echo y >staged.txt && git add staged.txt && rm calc.sh && echo "*" >>.git/info/exclude && echo h >hidden.txt && git config filter.slow.smudge "sleep 300; cat" && mkdir -p .git/hooks "$HOME/hooks2" && git config core.hooksPath "$HOME/hooks2" && printf "#!/bin/sh\ntouch \"$HOME/ran-hook\"\n" >.git/hooks/post-checkout && chmod +x .git/hooks/post-checkout'
-  restored='test "$(cat README)" = original || { echo "restored: README"; exit 1; }; test -f calc.sh || { echo "restored: calc.sh"; exit 1; }; ! test -e stray.txt || { echo "restored: stray"; exit 1; }; ! test -e staged.txt || { echo "restored: staged"; exit 1; }; ! test -e hidden.txt || { echo "restored: hidden"; exit 1; }; test -e cache/job1-cache || { echo "restored: cache"; exit 1; }; test -z "$(git status --porcelain --untracked-files=all | grep -v " test_new[.]sh$")" || { echo "restored: status: $(git status --porcelain --untracked-files=all | head -5)"; exit 1; }; ! git config --get filter.slow.smudge || { echo "restored: filter"; exit 1; }; ! git config --get core.hooksPath || { echo "restored: hooksPath"; exit 1; }; ! test -e "$HOME/ran-hook" || { echo "restored: hook ran"; exit 1; }; test "$(stat -c %u README)" = "$(id -u)" || { echo "restored: README owner"; exit 1; }; test "$(stat -c %u .git/config)" = "$(id -u)" || { echo "restored: config owner"; exit 1; }; exit 0'
+  # The places outside the tree, an ignore rule of the job's own, and a replace ref that points the
+  # base commit at a commit the job made.
+  tamper+=' && mkdir -p planted /tmp/job1-dir && printf "*\\n" >planted/.gitignore && echo p >planted/calc.sh && echo e >"$HOME/.npmrc" && echo e >/tmp/job1-dir/f && echo e >/var/tmp/job1-var && echo e >/dev/shm/job1-shm && echo more >>/tmp/setup-mod && ipcmk --shmem 1024 >/dev/null && git -c user.name=t -c user.email=t@t commit -q -m evil && git replace '"$sha"' HEAD'
+  restored='test "$(cat README)" = original || { echo "restored: README"; exit 1; }; test -f calc.sh || { echo "restored: calc.sh"; exit 1; }; ! test -e stray.txt || { echo "restored: stray"; exit 1; }; ! test -e staged.txt || { echo "restored: staged"; exit 1; }; ! test -e hidden.txt || { echo "restored: hidden"; exit 1; }; test -e cache/job1-cache || { echo "restored: cache"; exit 1; }; test -z "$(git status --porcelain --untracked-files=all | grep -v " test_new[.]sh$")" || { echo "restored: status: $(git status --porcelain --untracked-files=all | head -5)"; exit 1; }; ! git config --get filter.slow.smudge || { echo "restored: filter"; exit 1; }; ! git config --get core.hooksPath || { echo "restored: hooksPath"; exit 1; }; ! test -e "$HOME/ran-hook" || { echo "restored: hook ran"; exit 1; }; test "$(stat -c %u README)" = "$(id -u)" || { echo "restored: README owner"; exit 1; }; test "$(stat -c %u .git/config)" = "$(id -u)" || { echo "restored: config owner"; exit 1; }; ! test -e planted || { echo "restored: job-made ignore rule"; exit 1; }; test -z "$(git replace -l)" || { echo "restored: replace ref"; exit 1; }; ! test -e "$HOME/.npmrc" || { echo "restored: home"; exit 1; }; ! test -e /tmp/job1-dir || { echo "restored: /tmp"; exit 1; }; ! test -e /var/tmp/job1-var || { echo "restored: /var/tmp"; exit 1; }; ! test -e /dev/shm/job1-shm || { echo "restored: /dev/shm"; exit 1; }; test "$(ipcs -m | grep -c "^0x")" = 0 || { echo "restored: shared memory"; exit 1; }; test "$(cat /tmp/setup-keep)" = dep || { echo "restored: an unchanged setup file"; exit 1; }; ! test -e /tmp/setup-mod || { echo "restored: a changed setup file"; exit 1; }; test "$(cat "$HOME/.cache/dep")" = dep || { echo "restored: a setup home file"; exit 1; }; exit 0'
   sprobe='test -z "${BOOTSTRAP_URL:-}${REPO_TOKEN:-}${RESULT_URL:-}${NEXT_URL:-}${READY_URL:-}${AWS_SECRET_ACCESS_KEY:-}" && test -z "$(env | grep -E "leak|ghs_|127.0.0.1|bootstrap|SIGSECRE[T]|session[s]|job[s]/")"'
 
   results=$(mktemp -d -p "$tmp")
@@ -184,7 +189,7 @@ session_cases() {
   jq -n --arg end "$end" --arg sha "$sha" --arg daemon "$daemon" --arg tamper "$tamper" \
     --arg restored "$restored" --arg leftover "$leftover_probe" --arg probe "$sprobe" \
     --arg proc "$proc_probe" --arg dirp "$dir_probe" "$jq_defs"'
-    [step(0; "deps"; "setup"; "mkdir -p cache && echo run >> cache/setup-runs"),
+    [step(0; "deps"; "setup"; "mkdir -p cache \"$HOME/.cache\" && echo run >> cache/setup-runs && echo dep >/tmp/setup-keep && echo dep >/tmp/setup-mod && echo dep >\"$HOME/.cache/dep\""),
      step(1; "tests"; "test"; "sh test_old.sh"),
      step(2; "tamper"; "check"; $tamper),
      step(3; "daemon"; "check"; $daemon),
