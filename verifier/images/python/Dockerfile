@@ -27,6 +27,12 @@ RUN --mount=type=bind,source=images/python,target=/tmp/pip-fix \
       --min msgpack==1.2.1 \
       --build-from-sdist msgpack
 
+# No directory the unprivileged user can write may be one root executes from or has on its PATH
+# (the runner is root, the repository's commands are not): the base's own world-writable
+# directories lose their write bits. verifier/test/image_audit.sh proves it in the built image.
+RUN --mount=type=bind,source=harden-writable.sh,target=/tmp/harden-writable.sh \
+    bash /tmp/harden-writable.sh sandbox
+
 COPY run.sh /usr/local/bin/verifier-run
 COPY images/python/step.env /etc/verifier/step.env
 RUN chmod 0755 /usr/local/bin/verifier-run

@@ -48,6 +48,13 @@ repository's setting allows it; on the hosted verifier that is enforced by an eg
 and per-run secrets the platform revokes, on your own verifier your network rules decide.
 Everything a runner of version 2 was given still works with version 3.
 
+The runner is root and a repository's commands are not, so it never executes anything those
+commands could have written: everything it runs as root is looked up on one fixed `PATH`, set
+before its first command and never taken from the image, and it refuses to start (exit `2`)
+when one of those programs, or a directory on the way, can be changed by anyone but root. The
+images ship no directory the commands can write outside their home, `/tmp`, `/var/tmp`,
+`/dev/shm` and `/dev/mqueue`, and `verifier/test/contract.sh` audits that in every image.
+
 The full contract is [`verifier/contract.md`](verifier/contract.md), and the runner is
 [`verifier/run.sh`](verifier/run.sh).
 The platform side keeps a pinned copy of both files and checks it against this repository, so a
@@ -79,7 +86,9 @@ python3 -I -m unittest discover -s tests -v
 They cover the image sources (every base pinned by digest, the pinned inputs of the node and
 python images, the scanner exception), the scripts the Dockerfiles run, this repository's
 workflow, and the runner's session mode and network rule (`run.sh` driven against a loopback
-platform and a local proxy, in `tests/test_session.py` and `tests/test_session_network.py`).
+platform and a local proxy, in `tests/test_session.py` and `tests/test_session_network.py`),
+and that the runner never executes a program the repository could have planted
+(`tests/test_root_path.py`).
 They need `bash`, `git`, `jq`, `curl`, `openssl` and `tar`; set
 `VERIFIER_TESTS_REQUIRE_TOOLS=1` to fail instead of skip when one is missing. The publishing
 workflow runs them first, and nothing is built or published when one fails.

@@ -318,7 +318,7 @@ class SessionCase(TempDirCase):
             'exec "%s" "$@"\n' % (self.events_log, real)
         )
         script.chmod(0o755)
-        return {"PATH": "%s:%s" % (bin_dir, os.environ["PATH"])}
+        return {"VERIFIER_TEST_BIN": str(bin_dir)}
 
     def record_argv(self, *names):
         """Puts a recording stand-in for each named program in front of the real one: every
@@ -336,7 +336,7 @@ class SessionCase(TempDirCase):
                 "#!/bin/sh\nfor a in \"$@\"; do printf '%%s\\n' \"$a\"; done >>\"%s\"\nexec \"%s\" \"$@\"\n" % (log, real)
             )
             script.chmod(0o755)
-        return {"PATH": "%s:%s" % (bin_dir, os.environ["PATH"])}, log
+        return {"VERIFIER_TEST_BIN": str(bin_dir)}, log
 
     def events(self):
         lines = [json.loads(line) for line in self.events_log.read_text().splitlines() if line.strip()]

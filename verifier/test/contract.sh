@@ -18,7 +18,14 @@
 #     repository's own commands plant what the runner's git runs (a hook, a config
 #     entry, a filter) or block a file the patch is written to;
 #   * git hooks and untrusted git configuration the commands plant never run;
-#   * a sandbox user that is root is refused.
+#   * a sandbox user that is root is refused;
+#   * the runner never executes anything the unprivileged user can plant: the image is audited
+#     for places that user can write (verifier/test/image_audit.sh: none on root's PATH, none
+#     outside its home, /tmp, /var/tmp, /dev/shm and /dev/mqueue); a setup command plants an
+#     executable named like every program the runner starts, in every directory it can write,
+#     and none of them runs as root, with the image's own PATH and with a PATH that names a
+#     directory the command made; and the runner refuses to start when a program it runs as root,
+#     or a directory it looks it up in, can be changed by group or other.
 #
 # Session mode (runner version 3), with the same uid separation:
 #
@@ -26,7 +33,7 @@
 #     commit (a tracked file edited, an untracked file, a staged file, a planted git
 #     configuration, hook and exclude file, a replace ref, an ignore rule the job wrote itself,
 #     all gone; an ignored cache kept), restored by the unprivileged user; and so is what the
-#     job left in the places outside the tree (its home, /tmp, /var/tmp, /dev/shm, a SysV shared
+#     job left in the places outside the tree (its home, /tmp, /var/tmp, /dev/shm, /run/lock, a SysV shared
 #     memory segment), while what setup left there unchanged stays;
 #   * the job clock holds against a command that ignores SIGTERM and starts a daemon;
 #   * `setup` never reruns, a job naming an index outside the snapshot, or carrying a command
@@ -101,7 +108,8 @@ run_case() {
 # the matching lines to /scan/found, except the two bare words the run cases' own scanning daemon
 # (see `daemon` below) looks for. Each pattern has a character class in it, so the scanner's own
 # command line does not match what it looks for.
-scan_script='( while :; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr "\000" "\n" | grep -a -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" -e "SIGSECRE[T]" -e "RUNNERCRE[D]" -e "SETUPCRE[D]" -e "CHECKSCRE[D]" -e "job[s]/" -e "session[s]/" -e "afte[r]=" | grep -a -v -x -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" >>/scan/found; sleep 0.01; done ) >/dev/null 2>&1 &
+scan_script='eval "${VERIFIER_TEST_PRELUDE:-:}"
+( while :; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr "\000" "\n" | grep -a -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" -e "SIGSECRE[T]" -e "RUNNERCRE[D]" -e "SETUPCRE[D]" -e "CHECKSCRE[D]" -e "job[s]/" -e "session[s]/" -e "afte[r]=" | grep -a -v -x -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" >>/scan/found; sleep 0.01; done ) >/dev/null 2>&1 &
 exec /usr/local/bin/verifier-run'
 
 jq_defs='def step($i; $n; $k; $c): {index: $i, name: $n, kind: $k, cmd: $c};
@@ -180,8 +188,8 @@ session_cases() {
   tamper='echo tampered >README && echo stray >stray.txt && echo c >cache/job1-cache && echo y >staged.txt && git add staged.txt && rm calc.sh && echo "*" >>.git/info/exclude && echo h >hidden.txt && git config filter.slow.smudge "sleep 300; cat" && mkdir -p .git/hooks "$HOME/hooks2" && git config core.hooksPath "$HOME/hooks2" && printf "#!/bin/sh\ntouch \"$HOME/ran-hook\"\n" >.git/hooks/post-checkout && chmod +x .git/hooks/post-checkout'
   # The places outside the tree, an ignore rule of the job's own, and a replace ref that points the
   # base commit at a commit the job made.
-  tamper+=' && mkdir -p planted /tmp/job1-dir && printf "*\\n" >planted/.gitignore && echo p >planted/calc.sh && echo e >"$HOME/.npmrc" && echo e >/tmp/job1-dir/f && echo e >/var/tmp/job1-var && echo e >/dev/shm/job1-shm && echo more >>/tmp/setup-mod && ipcmk --shmem 1024 >/dev/null && git -c user.name=t -c user.email=t@t commit -q -m evil && git replace '"$sha"' HEAD'
-  restored='test "$(cat README)" = original || { echo "restored: README"; exit 1; }; test -f calc.sh || { echo "restored: calc.sh"; exit 1; }; ! test -e stray.txt || { echo "restored: stray"; exit 1; }; ! test -e staged.txt || { echo "restored: staged"; exit 1; }; ! test -e hidden.txt || { echo "restored: hidden"; exit 1; }; test -e cache/job1-cache || { echo "restored: cache"; exit 1; }; test -z "$(git status --porcelain --untracked-files=all | grep -v " test_new[.]sh$")" || { echo "restored: status: $(git status --porcelain --untracked-files=all | head -5)"; exit 1; }; ! git config --get filter.slow.smudge || { echo "restored: filter"; exit 1; }; ! git config --get core.hooksPath || { echo "restored: hooksPath"; exit 1; }; ! test -e "$HOME/ran-hook" || { echo "restored: hook ran"; exit 1; }; test "$(stat -c %u README)" = "$(id -u)" || { echo "restored: README owner"; exit 1; }; test "$(stat -c %u .git/config)" = "$(id -u)" || { echo "restored: config owner"; exit 1; }; ! test -e planted || { echo "restored: job-made ignore rule"; exit 1; }; test -z "$(git replace -l)" || { echo "restored: replace ref"; exit 1; }; ! test -e "$HOME/.npmrc" || { echo "restored: home"; exit 1; }; ! test -e /tmp/job1-dir || { echo "restored: /tmp"; exit 1; }; ! test -e /var/tmp/job1-var || { echo "restored: /var/tmp"; exit 1; }; ! test -e /dev/shm/job1-shm || { echo "restored: /dev/shm"; exit 1; }; test "$(ipcs -m | grep -c "^0x")" = 0 || { echo "restored: shared memory"; exit 1; }; test "$(cat /tmp/setup-keep)" = dep || { echo "restored: an unchanged setup file"; exit 1; }; ! test -e /tmp/setup-mod || { echo "restored: a changed setup file"; exit 1; }; test "$(cat "$HOME/.cache/dep")" = dep || { echo "restored: a setup home file"; exit 1; }; exit 0'
+  tamper+=' && mkdir -p planted /tmp/job1-dir && printf "*\\n" >planted/.gitignore && echo p >planted/calc.sh && echo e >"$HOME/.npmrc" && echo e >/tmp/job1-dir/f && echo e >/var/tmp/job1-var && echo e >/dev/shm/job1-shm && echo e >/run/lock/job1-lock && echo more >>/tmp/setup-mod && ipcmk --shmem 1024 >/dev/null && git -c user.name=t -c user.email=t@t commit -q -m evil && git replace '"$sha"' HEAD'
+  restored='test "$(cat README)" = original || { echo "restored: README"; exit 1; }; test -f calc.sh || { echo "restored: calc.sh"; exit 1; }; ! test -e stray.txt || { echo "restored: stray"; exit 1; }; ! test -e staged.txt || { echo "restored: staged"; exit 1; }; ! test -e hidden.txt || { echo "restored: hidden"; exit 1; }; test -e cache/job1-cache || { echo "restored: cache"; exit 1; }; test -z "$(git status --porcelain --untracked-files=all | grep -v " test_new[.]sh$")" || { echo "restored: status: $(git status --porcelain --untracked-files=all | head -5)"; exit 1; }; ! git config --get filter.slow.smudge || { echo "restored: filter"; exit 1; }; ! git config --get core.hooksPath || { echo "restored: hooksPath"; exit 1; }; ! test -e "$HOME/ran-hook" || { echo "restored: hook ran"; exit 1; }; test "$(stat -c %u README)" = "$(id -u)" || { echo "restored: README owner"; exit 1; }; test "$(stat -c %u .git/config)" = "$(id -u)" || { echo "restored: config owner"; exit 1; }; ! test -e planted || { echo "restored: job-made ignore rule"; exit 1; }; test -z "$(git replace -l)" || { echo "restored: replace ref"; exit 1; }; ! test -e "$HOME/.npmrc" || { echo "restored: home"; exit 1; }; ! test -e /tmp/job1-dir || { echo "restored: /tmp"; exit 1; }; ! test -e /var/tmp/job1-var || { echo "restored: /var/tmp"; exit 1; }; ! test -e /dev/shm/job1-shm || { echo "restored: /dev/shm"; exit 1; }; ! test -e /run/lock/job1-lock || { echo "restored: /run/lock"; exit 1; }; test "$(ipcs -m | grep -c "^0x")" = 0 || { echo "restored: shared memory"; exit 1; }; test "$(cat /tmp/setup-keep)" = dep || { echo "restored: an unchanged setup file"; exit 1; }; ! test -e /tmp/setup-mod || { echo "restored: a changed setup file"; exit 1; }; test "$(cat "$HOME/.cache/dep")" = dep || { echo "restored: a setup home file"; exit 1; }; exit 0'
   sprobe='test -z "${BOOTSTRAP_URL:-}${REPO_TOKEN:-}${RESULT_URL:-}${NEXT_URL:-}${READY_URL:-}${AWS_SECRET_ACCESS_KEY:-}" && test -z "$(env | grep -E "leak|ghs_|127.0.0.1|bootstrap|SIGSECRE[T]|session[s]|job[s]/")"'
 
   results=$(mktemp -d -p "$tmp")
@@ -209,7 +217,8 @@ session_cases() {
               {status: 200, job: job(4; [$steps[9]]; [])},
               {status: 200, job: job(5; [step(9; "count"; "check"; "touch ghost_from_text")]; [])},
               {status: 200, job: job(6; [$steps[11]]; [])}]}' >"$scenario"
-  run_session "$tag" "$tmp" "$port" "$scenario" "$results"
+  # /run/lock is made writable for this case (the images make it unwritable, and a runtime may not).
+  run_session "$tag" "$tmp" "$port" "$scenario" "$results" -e "VERIFIER_TEST_PRELUDE=chmod 1777 /run/lock"
   expect_all_pass "$results/ready.json" "the session boot"
   jq -e '.baseline_green == true and .runner.version == 3' "$results/ready.json" >/dev/null || fail "the ready report is not green, version 3"
   expect_all_pass "$results/result-1.json" "job 1"
@@ -356,6 +365,66 @@ network_cases() {
   done
 }
 
+# root_exec_cases TAG TMP SHA: the runner is root and a command is not, so nothing the command can
+# write may ever be executed by the runner. A setup command (the unprivileged user) plants an
+# executable named like every program the runner starts, in every directory it can write; each
+# plant marks / (which only root can write) and then runs the real program, so a runner that
+# executes one goes on working and is caught by the marker. Two runs: the image's own PATH, and a
+# PATH that names a directory the command made first (as an image or a task definition could set
+# it). Two jobs follow the boot, so the calls the restore, the report and the job make are
+# covered as well as those of the boot.
+root_exec_cases() {
+  local tag=$1 tmp=$2 sha=$3
+  local end tools plant image_path variant results scenario port extra
+  end=$(date -u -d '+30 minutes' +%Y-%m-%dT%H:%M:%SZ)
+  tools=$(sed -n '/^ROOT_TOOLS=(/,/^)/p' "$here/run.sh" | sed '1d;$d' | tr -s ' \n' ' ')
+  [ -n "$tools" ] || fail "run.sh lists no ROOT_TOOLS"
+  plant='mkdir -p /tmp/evilbin "$HOME/evilbin" && real="" && for t in '"$tools"'; do r=$(PATH=/usr/bin:/bin:/usr/sbin:/sbin command -v "$t") && real="$real $t=$r"; done && for d in $(find / \( -path /proc -o -path /sys \) -prune -o -type d -writable -print 2>/dev/null; find "$HOME" -type d -writable 2>/dev/null); do for pair in $real; do t=${pair%%=*}; r=${pair#*=}; printf "#!/bin/sh\n: >/pwned-root-%s 2>/dev/null\nexec %s \"\$@\"\n" "$t" "$r" >"$d/$t" 2>/dev/null && chmod +x "$d/$t" 2>/dev/null; done; done; test -n "$real"'
+  image_path=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$tag" | sed -n 's/^PATH=//p')
+  [ -n "$image_path" ] || fail "the image has no PATH"
+
+  for variant in image_path made_dir_first; do
+    extra=()
+    if [ "$variant" = made_dir_first ]; then extra=(-e "PATH=/tmp/evilbin:$image_path"); fi
+    results=$(mktemp -d -p "$tmp")
+    scenario="$results/scenario.json"
+    port=$((20000 + RANDOM % 20000))
+    jq -n --arg end "$end" --arg sha "$sha" --arg plant "$plant" "$jq_defs"'
+      [step(0; "plant"; "setup"; $plant),
+       step(1; "tests"; "test"; "sh test_old.sh"),
+       step(2; "planted"; "check"; "test -x /tmp/evilbin/jq && test -x \"$HOME/evilbin/wc\" && test -x /tmp/evilbin/find"),
+       step(3; "clean"; "check"; "for f in /pwned-root-*; do if [ -e \"$f\" ]; then echo \"ran as root: $f\"; exit 1; fi; done; exit 0")] as $steps
+      | {bootstrap: session($end; $sha; $steps; {}),
+         next: [{status: 200, job: job(1; [$steps[2], $steps[3]]; [])},
+                {status: 200, job: job(2; [$steps[3]]; [])}]}' >"$scenario"
+    run_session "$tag" "$tmp" "$port" "$scenario" "$results" "${extra[@]}"
+    expect_all_pass "$results/ready.json" "the boot with a binary planted in every writable directory ($variant)"
+    expect_all_pass "$results/result-1.json" "job 1: the runner executed nothing the repository planted ($variant)"
+    expect_all_pass "$results/result-2.json" "job 2: the runner executed nothing the repository planted ($variant)"
+  done
+}
+
+# trust_cases TAG: the runner refuses to start when a program it runs as root, or a directory it
+# looks the program up in, can be changed by group or other (an image defect: nothing of the
+# repository has run when this is checked).
+trust_cases() {
+  local tag=$1 breakage out
+  for breakage in \
+    'chmod 0775 /usr/bin/jq' \
+    'chmod 1777 /usr/local/bin' \
+    "printf '#!/bin/sh\\n' >/tmp/planted && chmod 0755 /tmp/planted && ln -sf /tmp/planted /usr/local/bin/wc"; do
+    out=$(docker run --rm --network host -e BOOTSTRAP_URL=http://127.0.0.1:1/bootstrap --entrypoint /bin/sh "$tag" \
+      -c "$breakage; /usr/local/bin/verifier-run; echo status=\$?" 2>&1) || true
+    case "$out" in
+      *"refusing to run"*"status=2"*) ;;
+      *)
+        printf '%s\n' "$out" >&2
+        fail "the runner started although: $breakage"
+        ;;
+    esac
+  done
+}
+
 for runtime in "${runtimes[@]}"; do
   echo "== $runtime"
   tag="verifier-contract-$runtime:local"
@@ -383,6 +452,9 @@ for runtime in "${runtimes[@]}"; do
       fail "the go image has go$go_release, below the go1.26.9 floor"
     fi
   fi
+
+  docker run --rm -v "$here/test/image_audit.sh:/audit.sh:ro" --entrypoint bash "$tag" /audit.sh ||
+    fail "the $runtime image lets the unprivileged user write a place the runner executes from (see above)"
 
   tmp=$(mktemp -d)
   trap cleanup EXIT
@@ -616,6 +688,8 @@ sleep 0.5'
 
   session_cases "$tag" "$tmp" "$sha"
   network_cases "$tag" "$tmp" "$sha"
+  root_exec_cases "$tag" "$tmp" "$sha"
+  trust_cases "$tag"
 
   echo "ok: $runtime"
 done

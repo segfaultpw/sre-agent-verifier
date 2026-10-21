@@ -150,7 +150,10 @@ Command names are `[a-z][a-z0-9_]{0,39}` and never `baseline`, `new_test_fails_b
    user, in a session of their own, with the rebuilt environment, killed with everything
    they started.
 9. Uploads the result and exits `0`. A refused upload exits `1`. A missing
-   `BOOTSTRAP_URL` exits `2`: nothing can be fetched.
+   `BOOTSTRAP_URL` exits `2`: nothing can be fetched. So does a runner that is root and finds
+   a program it runs as root, or a directory it looks the program up in, owned by somebody but
+   root or writable by group or other (see "What the runner executes"): it logs the place and
+   starts nothing, because no result URL has been read yet.
 
 The runner never reads another variable, never writes outside its workspace, never
 pushes, comments or opens anything, and never makes a request other than the bootstrap
@@ -186,6 +189,36 @@ repository's own), and everything it started is ended when it returns. An operat
 cuts short is reported as a `timeout` of the runner's own `patch` step, which the platform
 reads as a limit. The helper that sends the uid-wide `SIGKILL` runs with an empty
 environment: `env -i` starts it, as root, before it becomes the unprivileged user.
+
+### What the runner executes
+
+The runner is root and the repository's commands are not, so a program the runner starts as
+root must never be one the unprivileged user could have written or replaced. Two rules hold,
+and the images and `verifier/test/contract.sh` prove both:
+
+* **One fixed `PATH` for everything root runs.** The first statements of `run.sh` set
+  `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` before any command runs
+  and nothing sets it again. The image's `PATH` (a language toolchain's directories first) is
+  kept aside and given to the repository's commands only, who run as the unprivileged user; the
+  runner's own operations on the tree (which also run as that user) get the fixed one. The
+  shell a command is started with is the runner's own bash by absolute path, not a name looked
+  up.
+* **Nothing root executes can be changed by anyone but root.** When the runner starts as root
+  it checks, before it reads the bootstrap, that every directory of that `PATH`, every program
+  it starts as root by name (the `ROOT_TOOLS` list in `run.sh`, with every link followed) and
+  every directory above those is owned by root and writable by neither group nor other (a
+  sticky or setgid bit does not excuse a group or other write bit). A failure is logged by
+  path and the runner exits `2` before any command has run. Nothing of the repository has run at
+  that point, so this is a check of the image, not a race.
+
+The images keep their half of it: `verifier/harden-writable.sh` runs in every image and
+removes the write bits of every directory outside the places below that the unprivileged user
+could write (the Go image's GOPATH directory and the PHP image's web root, both mode `1777` in
+their bases; `/run/lock` in every one), and `verifier/test/image_audit.sh` asks the kernel, as
+the unprivileged user, what it can write in the built image: nothing on the runner's or the
+image's `PATH`, nothing the runner executes or reads its configuration from, and nothing
+outside its home, `/tmp`, `/var/tmp`, `/dev/shm` and `/dev/mqueue`. Go's `GOPATH` (and so
+`go install`'s directory) is in the sandbox user's home, which root never puts on a `PATH`.
 
 ## Own limits (second line behind the platform's reaper)
 
@@ -435,9 +468,11 @@ Gone before the next job:
   paths below (nested repositories included), every `.gitattributes`, `.gitignore` or exclude
   rule a job wrote;
 * in the unprivileged user's home, `TMPDIR` (`$WORK/tmp`, set for every command of a session),
-  `/tmp`, `/var/tmp` and `/dev/shm` (and the home of the sandbox user in the image): every file
-  or directory the unprivileged user owns that was not there at ready or is not exactly as it
-  was (path, type, mode, size, mtime and ctime, which a process cannot set).
+  `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` and `/dev/mqueue` (and the home of the sandbox user
+  in the image): every file or directory the unprivileged user owns that was not there at ready
+  or is not exactly as it was (path, type, mode, size, mtime and ctime, which a process cannot
+  set). `/run/lock` is mode `1777` in a stock Debian or Ubuntu and `/dev/mqueue` is a mount the
+  container runtime adds, so both are in the list although the images make the first unwritable.
 
 Kept, on purpose, because they are the dependency and build caches that make a session fast:
 
@@ -449,9 +484,17 @@ Kept, on purpose, because they are the dependency and build caches that make a s
   left and no job changed. A file a job changed or deleted is not brought back: a changed one is
   removed, a deleted one stays deleted (the next command refetches or rebuilds it).
 
-A place the unprivileged user can write that is none of the above persists. The images make
-none (the work directory, the rule pack and the runner's own files are root's), and a second
-mount an operator adds is the operator's to account for.
+**What persists, stated as a whole.** Two kinds of thing persist from one job to the next, and
+both are listed above: the paths `setup` and the baseline left ignored (and whatever a job
+writes inside them), and the files and directories `setup` or the baseline left in the home,
+`TMPDIR`, `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` and `/dev/mqueue` that no job changed.
+Nothing else the unprivileged user can write persists unrestored, because the images leave it
+nothing else to write: the work directory (mode `0711`), the rule pack, the runner's own files
+and every other directory are root's and closed to group and other, which
+`verifier/test/image_audit.sh` checks in every built image. A second mount an operator adds (a
+volume, a `tmpfs`) is the operator's to account for. Separately from persistence, **root never
+executes anything from a place the unprivileged user can write**, restored or not: see "What the
+runner executes".
 
 ## Running it in your own account
 
@@ -553,8 +596,8 @@ same uid separation: that a daemon a job started is dead before the next job; th
 job's tree is the base commit as the unprivileged user restores it (an edited tracked file, an
 untracked file, a staged file, a planted git configuration, hook and exclude file, a replace
 ref and a job-made ignore rule gone; an ignored cache kept), and that what a job left in its
-home, `/tmp`, `/var/tmp`, `/dev/shm` and in SysV shared memory is gone while what setup left
-there unchanged stays; that the job clock holds against a command that ignores `SIGTERM`; that
+home, `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` and in SysV shared memory is gone while what
+setup left there unchanged stays; that the job clock holds against a command that ignores `SIGTERM`; that
 `setup` never reruns and that a job naming an index outside the snapshot, or carrying a command text
 that is not the snapshot's, is refused and its text never runs; that the
 runner exits on `410` and when idle; that no URL or secret is on any command line (a scanner
@@ -562,7 +605,14 @@ running as root for the whole run looks) or in a command's environment; and, thr
 proxy that admits only the secrets the platform lists as live, that a job command opening a
 connection to an allowed host fails after setup when the network rule is off and succeeds when it
 is on, and that the secret a `setup` command saved is refused once setup is done, for the
-baseline as for every later command. `tests/test_session.py` and `tests/test_session_network.py` run the same cases, and the
+baseline as for every later command. It also audits every image for places the unprivileged user
+can write (`verifier/test/image_audit.sh`), plants, from a `setup` command, an executable named
+like every program the runner starts in every directory that user can write (and puts a directory
+it made first on the container's `PATH`), and proves that none of them runs as root through the
+boot and two jobs; and it proves that the runner refuses to start when a program it runs as root,
+a directory it looks that program up in, or a link on the way is group or other writable.
+`tests/test_session.py` and `tests/test_session_network.py` run the session cases, and
+`tests/test_root_path.py` the planted-program and ownership cases, and the
 back-off table, against `run.sh` without Docker.
 
 ### The one scanner exception: pip's `pkg_resources` (CVE-2025-47273)

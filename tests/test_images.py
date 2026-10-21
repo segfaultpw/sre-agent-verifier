@@ -3,6 +3,7 @@ the runner copied in with its step environment, the pinned build inputs of the p
 node images, the scanner exception, and the documents that describe them."""
 
 import json
+import os
 import re
 import unittest
 
@@ -41,6 +42,52 @@ class ImagePerRuntimeTest(unittest.TestCase):
         self.assertIsNotNone(line)
         named = re.findall(r"`([a-z]+)`", line.group(1))
         self.assertEqual(sorted(named), sorted(RUNTIMES))
+
+
+class HardeningTest(unittest.TestCase):
+    """Root must never execute what the unprivileged user can write: every image closes the
+    base's world-writable directories, and the contract script audits and probes the result."""
+
+    SCRIPT = VERIFIER / "harden-writable.sh"
+
+    def test_the_script_exists_is_executable_and_stops_on_error(self):
+        text = self.SCRIPT.read_text()
+        self.assertTrue(os.access(self.SCRIPT, os.X_OK))
+        self.assertIn("set -euo pipefail", text)
+        self.assertIn("-perm -0002", text)
+
+    def test_every_image_runs_it_as_the_sandbox_user_after_its_last_root_step(self):
+        for runtime in RUNTIMES:
+            with self.subTest(runtime=runtime):
+                text = dockerfile(runtime)
+                run = "bash /tmp/harden-writable.sh sandbox"
+                self.assertEqual(text.count(run), 1)
+                self.assertIn(
+                    "--mount=type=bind,source=harden-writable.sh,target=/tmp/harden-writable.sh", text
+                )
+                at = text.index(run)
+                for later in ("ENTRYPOINT", "ENV VERIFIER_RUNTIME"):
+                    self.assertGreater(text.index(later), at, later)
+                for earlier in ("useradd --create-home --uid 10001", "mix local.hex", "fix-npm-bundled.sh", "fix-pip-vendored.sh"):
+                    if earlier in text:
+                        self.assertLess(text.index(earlier), at, earlier)
+
+    def test_the_contract_script_audits_every_image_and_probes_the_runner(self):
+        text = (VERIFIER / "test" / "contract.sh").read_text()
+        for needle in ("image_audit.sh", "root_exec_cases", "trust_cases", "ROOT_TOOLS"):
+            self.assertIn(needle, text)
+        self.assertTrue(os.access(VERIFIER / "test" / "image_audit.sh", os.X_OK))
+
+    def test_the_contract_states_what_root_executes_and_what_persists(self):
+        text = " ".join(read(CONTRACT).split())
+        for needle in (
+            "### What the runner executes",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "root never executes anything from a place the unprivileged user can write",
+            "`/run/lock` and `/dev/mqueue`",
+        ):
+            self.assertIn(needle, text)
+        self.assertNotIn("The images make none", text)
 
 
 class EachImageTest(unittest.TestCase):

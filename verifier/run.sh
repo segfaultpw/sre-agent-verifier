@@ -20,9 +20,26 @@
 # the same discipline as a step: the repository's commands can plant what they run (a
 # git hook, a filter, a FIFO where a file goes), so each runs as the unprivileged user,
 # in its own session, under the run's clock, with git's hooks and untrusted
-# configuration switched off, and ends everything it started.
+# configuration switched off, and ends everything it started. And the reverse: root never
+# executes what the unprivileged user could have written. Every program root runs is found on
+# SAFE_PATH (set first, below), never on the image's PATH, and a root runner refuses to start
+# unless those programs and the directories on the way are root's and closed to group and other.
 
 set -uo pipefail
+
+# Everything this process runs as root resolves its tools through this PATH and no other. It is
+# set before the first command, once, and is neither the image's PATH (a language toolchain's
+# directory can be writable by the unprivileged user, and a binary it plants there would run as
+# root the next time the runner called that tool) nor anything a job could change. The
+# repository's own commands get the image's PATH instead, as the unprivileged user (IMAGE_PATH).
+SAFE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+IMAGE_PATH=${PATH:-$SAFE_PATH}
+# The one exception is for the host tests of the unprivileged runner (stand-ins in front of the real
+# programs); a root runner, which is the only kind that has anything to protect, never takes it.
+if [ "$EUID" -ne 0 ] && [ "${VERIFIER_ALLOW_UNPRIVILEGED:-0}" = 1 ] && [ -n "${VERIFIER_TEST_BIN:-}" ]; then SAFE_PATH=$VERIFIER_TEST_BIN:$SAFE_PATH; fi
+PATH=$SAFE_PATH
+export PATH
+hash -r
 
 log() { printf '[verifier] %s\n' "$*" >&2; }
 
@@ -61,6 +78,86 @@ if [ -z "$BOOTSTRAP_URL" ]; then
   log "BOOTSTRAP_URL is not set: nothing can be fetched and nothing can be reported"
   exit 2
 fi
+
+# Every program the runner starts as root, by name. None is looked up anywhere but SAFE_PATH, and
+# when the runner is root nothing on the way to any of them may be changed by anybody but root:
+# every directory of SAFE_PATH, the file each name resolves to (links followed) and every
+# directory above those are owned by root and writable by neither group nor other. A directory of
+# SAFE_PATH counts even when it holds none of the tools, because a name found later in the list
+# would otherwise be shadowed by what the unprivileged user planted in an earlier one. (Nothing
+# of the repository has run yet at this point, so this checks the image, not a race; the
+# unprivileged user cannot change a root-owned directory later.) ipcrm is optional, and checked
+# when the image has it.
+ROOT_TOOLS=(
+  base64 cat chmod chown comm cp curl cut date env find getent git grep head id install jq
+  mkdir mkfifo mv readlink realpath rm sed setpriv setsid sleep sort stat tail timeout tr
+  wc xargs
+)
+ROOT_TOOLS_OPTIONAL=(ipcrm)
+
+# trusted_path PATH [OWNER_UID]: PATH is owned by OWNER_UID (root) and not writable by group or
+# other. A sticky or setgid bit does not make a directory the unprivileged user cannot write
+# trustworthy, so any group or other write bit refuses it.
+declare -A TRUSTED_SEEN=()
+trusted_path() {
+  local target=$1 owner_wanted=${2:-0} owner mode
+  [ -z "${TRUSTED_SEEN[$owner_wanted:$target]:-}" ] || return 0
+  read -r owner mode < <(stat -c '%u %a' -- "$target" 2>/dev/null) || return 1
+  [ "$owner" = "$owner_wanted" ] || return 1
+  [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+  TRUSTED_SEEN[$owner_wanted:$target]=1
+}
+
+# trusted_chain PATH [OWNER_UID]: PATH after resolving every link (or, when it does not exist,
+# the nearest existing place above it, which is what could create it), and each directory above
+# that, pass trusted_path. The first that does not is left in UNTRUSTED.
+UNTRUSTED=""
+trusted_chain() {
+  local walk owner_wanted=${2:-0}
+  walk=$(readlink -m -- "$1" 2>/dev/null) || walk=""
+  while [ -n "$walk" ] && [ ! -e "$walk" ] && [ "$walk" != / ]; do
+    walk=${walk%/*}
+    [ -n "$walk" ] || walk=/
+  done
+  walk=$(readlink -f -- "${walk:-/nonexistent}" 2>/dev/null) || walk=""
+  if [ -z "$walk" ]; then
+    UNTRUSTED=$1
+    return 1
+  fi
+  while :; do
+    if ! trusted_path "$walk" "$owner_wanted"; then
+      UNTRUSTED=$walk
+      return 1
+    fi
+    [ "$walk" != / ] || return 0
+    walk=${walk%/*}
+    [ -n "$walk" ] || walk=/
+  done
+}
+
+# verify_root_tools: answers 0, or 1 with a log line naming the first place that fails.
+verify_root_tools() {
+  local tool found dir dirs
+  IFS=: read -r -a dirs <<<"$SAFE_PATH"
+  for dir in "${dirs[@]}" "$BASH"; do
+    if ! trusted_chain "$dir"; then
+      log "refusing to run: $UNTRUSTED is not owned by root or can be written by group or other, and the runner runs programs from $dir as root"
+      return 1
+    fi
+  done
+  for tool in "${ROOT_TOOLS[@]}" "${ROOT_TOOLS_OPTIONAL[@]}"; do
+    if ! found=$(command -v -- "$tool"); then
+      if [[ " ${ROOT_TOOLS_OPTIONAL[*]} " == *" $tool "* ]]; then continue; fi
+      log "the image has no $tool on $SAFE_PATH"
+      return 1
+    fi
+    if ! trusted_chain "$found"; then
+      log "refusing to run: $UNTRUSTED is not owned by root or can be written by group or other, and the runner runs $tool as root"
+      return 1
+    fi
+  done
+}
+if [ "$EUID" -eq 0 ] && ! verify_root_tools; then exit 2; fi
 
 # bash's own seconds counter measures every deadline: nothing forks to read a clock.
 SECONDS=0
@@ -111,7 +208,7 @@ else
   fi
 fi
 
-BASE_ENV=("PATH=$PATH" "HOME=$SANDBOX_HOME" "LANG=C.UTF-8" "CI=true" "TERM=dumb" "GIT_TERMINAL_PROMPT=0")
+BASE_ENV=("PATH=$IMAGE_PATH" "HOME=$SANDBOX_HOME" "LANG=C.UTF-8" "CI=true" "TERM=dumb" "GIT_TERMINAL_PROMPT=0")
 TASK_PROXY_ENV=()
 for name in "${PROXY_VARS[@]}"; do
   if [ -n "${!name:-}" ]; then TASK_PROXY_ENV+=("$name=${!name}"); fi
@@ -215,7 +312,7 @@ use_step_env setup
 # repository's commands could have written: no system or global git configuration, and
 # a home that does not exist. `-c` settings outrank the repository's own config, so
 # hooks and the file system monitor stay off whatever `.git/config` says.
-OP_ENV=("PATH=$PATH" "HOME=/nonexistent" "LANG=C.UTF-8" "GIT_TERMINAL_PROMPT=0"
+OP_ENV=("PATH=$SAFE_PATH" "HOME=/nonexistent" "LANG=C.UTF-8" "GIT_TERMINAL_PROMPT=0"
   "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_OPTIONAL_LOCKS=0" "GIT_NO_REPLACE_OBJECTS=1")
 if [ -n "$SANDBOX_UID" ]; then
   OP_PREFIX=(setpriv --reuid="$SANDBOX_UID" --regid="$SANDBOX_GID" --clear-groups
@@ -378,7 +475,7 @@ run_step() {
   # The proxy settings of the command (they can hold a secret) reach it through a pipe on
   # descriptor 3, which the command's own shell reads and closes before it runs anything,
   # so they are on no command line, in no file and in no environment but the command's.
-  (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" bash -c 'while IFS= read -r -d "" kv <&3; do [ -n "$kv" ] && export "$kv"; done; exec 3<&-; exec bash -c "$1"' sh "$cmd" \
+  (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" "$BASH" -c 'while IFS= read -r -d "" kv <&3; do [ -n "$kv" ] && export "$kv"; done; exec 3<&-; exec "$BASH" -c "$1"' sh "$cmd" \
     </dev/null 3< <(printf '%s\0' "${STEP_PROXY_ENV[@]}")) >"$fifo" 2>&1 &
   pid=$!
 
@@ -980,7 +1077,7 @@ record_ready_state() {
   if [ -n "$SANDBOX_UID" ]; then
     pw_home=$(getent passwd "$SANDBOX_USER" 2>/dev/null | cut -d: -f6)
     if [ -n "$pw_home" ] && [ "$pw_home" != "$SANDBOX_HOME" ]; then STATE_ROOTS+=("$pw_home"); fi
-    STATE_ROOTS+=(/tmp /var/tmp /dev/shm)
+    STATE_ROOTS+=(/tmp /var/tmp /dev/shm /run/lock /dev/mqueue)
   fi
   : >"$PRISTINE/state.roots"
   for root in "${STATE_ROOTS[@]}"; do printf '%s\n' "$root" >>"$PRISTINE/state.roots"; done
