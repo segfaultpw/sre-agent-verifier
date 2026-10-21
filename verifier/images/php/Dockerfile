@@ -17,6 +17,12 @@ RUN apt-get update \
  && mkdir -p /work /etc/verifier \
  && chmod 0711 /work
 
+# No directory the unprivileged user can write may be one root executes from or has on its PATH
+# (the runner is root, the repository's commands are not): the base's own world-writable
+# directories lose their write bits. verifier/test/image_audit.sh proves it in the built image.
+RUN --mount=type=bind,source=harden-writable.sh,target=/tmp/harden-writable.sh \
+    bash /tmp/harden-writable.sh sandbox
+
 COPY --from=composer /usr/bin/composer /usr/local/bin/composer
 COPY run.sh /usr/local/bin/verifier-run
 COPY images/php/step.env /etc/verifier/step.env

@@ -6,6 +6,12 @@ and after a proposed patch, reports what happened to a one-time URL and exits. T
 image runs on SRE Agent's hosted verifier (an ephemeral container task) and on
 infrastructure a customer owns; nothing in it is specific to one account.
 
+A runner of version 3 can also serve a **session**: one container start, one clone and a
+sequence of jobs for one fix, each reported on its own URL, until the platform ends the
+session (see "Session mode (runner version 3)" below). A run is unchanged by that: a
+version 3 runner given a run bootstrap does what a version 2 runner did, and a version 2
+platform keeps working against a version 3 runner.
+
 The platform starts the task, mints the token and URLs, serves the two URLs and judges
 what a result may contain. This file is the other half: what the runner reads, what it
 does and what it sends back.
@@ -33,6 +39,11 @@ of the result URL below.
 
 ## The bootstrap response
 
+The runner fetches the bootstrap with the query parameter `runner=3` (its version) added to
+the URL, every time. A version 2 platform ignores the parameter. A platform that can serve
+sessions gives a session only to a request that carries it, so a runner that does not know
+what a session is is never given one.
+
 ```json
 {
   "repo_url": "https://github.com/<owner>/<repo>.git",
@@ -43,7 +54,10 @@ of the result URL below.
   "max_output_bytes": 1000000,
   "steps": [{"index": 0, "name": "tests", "kind": "test", "cmd": "mix test"}],
   "files": [{"path": "lib/a.ex", "content": "...", "test": false}],
-  "analysis": {"rule_pack": "v1-3fa9c012", "files": {"missing-timeouts.yml": "rules: ..."}}
+  "analysis": {"rule_pack": "v1-3fa9c012", "files": {"missing-timeouts.yml": "rules: ..."}},
+  "proxy": {"user": "run:<id>", "runner": "<secret>", "setup": "<secret>"},
+  "setup_done_url": "a one-time PUT the runner makes once the last setup command has ended",
+  "network": false
 }
 ```
 
@@ -65,6 +79,9 @@ of the result URL below.
   has already replaced `{touched_files}` with the quoted paths of every file of the patch
   (a command that names them and has none is left out, as a `new_test` command is) and
   `{rule_pack}` with the version.
+* `proxy`, `setup_done_url` and `network` are the network rule, below. A run bootstrap
+  without them, as a version 2 platform sends it, gives every command the task definition's
+  proxy variables, exactly as before.
 * If the bootstrap is refused or unreachable there is no result URL, so nothing can be
   reported: the runner exits `1`. A hosted run ends at its deadline; a customer-run's job
   does not wait that long: the platform ends it as `error` / `start_failed` the moment its
@@ -76,7 +93,11 @@ Variables baked into the image or set by a test, never by the platform:
 `VERIFIER_WORKDIR` (default `/work`), `VERIFIER_SANDBOX_USER` (default `sandbox`) and
 `VERIFIER_ALLOW_UNPRIVILEGED` (tests only). `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
 (and lower-case forms) may come from the task definition; they are forwarded to the
-commands. The runner reads no other environment variable.
+commands, subject to the network rule below. `VERIFIER_PROXY_URL` is the one more variable
+of the task definition (never of the RunTask request): on the hosted verifier it names the
+egress proxy as `host:port` (an `http://` prefix is accepted) and switches the runner to
+per-run proxy secrets; a value that is not a host and port ends the runner with exit `2`.
+The runner reads no other environment variable.
 
 ## Command kinds
 
@@ -99,19 +120,23 @@ Command names are `[a-z][a-z0-9_]{0,39}` and never `baseline`, `new_test_fails_b
    is refused too: every command would run as root (or in root's group) and the uid-wide kill below would end the runner.
 2. Fetches the bootstrap, once.
 3. Clones: `git init`, `git fetch --depth 1 origin $BASE_SHA`, `git checkout`, into a
-   root-owned staging directory nobody else can reach. The token is given to that one
-   command through git's environment configuration, so it is written to no file and no git
-   config and is on no command line. The tree is then handed to the unprivileged user and
-   moved into place with one rename: root never writes inside a directory that user can
-   write. Step `clone`.
+   root-owned staging directory nobody else can reach. The token (and, on the hosted
+   verifier, the proxy and its secret) is given to that one command through git's
+   environment configuration, so it is written to no file and no git config and is on no
+   command line. The fetch is held to the run's clock; one the clock cuts off is a `clone` step with status
+   `error` and the excerpt "the clone was cut off by the clock". The tree is then handed to the
+   unprivileged user and moved into place with one rename: root never writes inside a
+   directory that user can write. Step `clone`.
 4. Checks every path in the patch again (no absolute path, no `..`, no `.git`, no doubled
-   or trailing separator, no symbolic link on the way), because the runner decides where it
+   or trailing separator, no `{` or `}`, no line break, no symbolic link on the way), because the runner decides where it
    is written. At most 20 files. Every write to the tree from here on (the patch, taking it
    back) is made by the unprivileged user, from a copy of the content that only root can
    write, and every git command the runner runs on the tree (`git ls-files` to learn whether
    a path is tracked, `git checkout -- <path>` to take it back) runs the way a step runs,
    below.
-5. Runs the `setup` commands. A failure ends the run with `baseline_green: false`.
+5. Runs the `setup` commands. A failure ends the run with `baseline_green: false`. When
+   the bootstrap carried a `setup_done_url`, the runner then `PUT`s `{}` to it, and the
+   answer may carry `{"proxy": {"checks": "<secret>"}}` (the network rule, below).
 6. Runs the `test` commands on the unmodified tree, reported as ONE step named
    `baseline`. The first failure sets `baseline_green: false` and ends the run: the change
    cannot be judged.
@@ -125,11 +150,16 @@ Command names are `[a-z][a-z0-9_]{0,39}` and never `baseline`, `new_test_fails_b
    user, in a session of their own, with the rebuilt environment, killed with everything
    they started.
 9. Uploads the result and exits `0`. A refused upload exits `1`. A missing
-   `BOOTSTRAP_URL` exits `2`: nothing can be fetched.
+   `BOOTSTRAP_URL` exits `2`: nothing can be fetched. So does a runner that is root and finds
+   a program it runs as root, or a directory it looks the program up in, owned by somebody but
+   root or writable by group or other (see "What the runner executes"): it logs the place and
+   starts nothing, because no result URL has been read yet.
 
 The runner never reads another variable, never writes outside its workspace, never
 pushes, comments or opens anything, and never makes a request other than the bootstrap
-`GET`, the clone and the one `PUT` (and whatever the repository's own commands do).
+`GET`, the clone, the `PUT` of `setup_done_url` when there is one and the one `PUT` of the
+result (and whatever the repository's own commands do). A session makes the requests listed
+under "Session mode (runner version 3)" instead of the one `PUT`.
 
 ## What a command sees, and what it leaves behind
 
@@ -160,6 +190,36 @@ cuts short is reported as a `timeout` of the runner's own `patch` step, which th
 reads as a limit. The helper that sends the uid-wide `SIGKILL` runs with an empty
 environment: `env -i` starts it, as root, before it becomes the unprivileged user.
 
+### What the runner executes
+
+The runner is root and the repository's commands are not, so a program the runner starts as
+root must never be one the unprivileged user could have written or replaced. Two rules hold,
+and the images and `verifier/test/contract.sh` prove both:
+
+* **One fixed `PATH` for everything root runs.** The first statements of `run.sh` set
+  `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` before any command runs
+  and nothing sets it again. The image's `PATH` (a language toolchain's directories first) is
+  kept aside and given to the repository's commands only, who run as the unprivileged user; the
+  runner's own operations on the tree (which also run as that user) get the fixed one. The
+  shell a command is started with is the runner's own bash by absolute path, not a name looked
+  up.
+* **Nothing root executes can be changed by anyone but root.** When the runner starts as root
+  it checks, before it reads the bootstrap, that every directory of that `PATH`, every program
+  it starts as root by name (the `ROOT_TOOLS` list in `run.sh`, with every link followed) and
+  every directory above those is owned by root and writable by neither group nor other (a
+  sticky or setgid bit does not excuse a group or other write bit). A failure is logged by
+  path and the runner exits `2` before any command has run. Nothing of the repository has run at
+  that point, so this is a check of the image, not a race.
+
+The images keep their half of it: `verifier/harden-writable.sh` runs in every image and
+removes the write bits of every directory outside the places below that the unprivileged user
+could write (the Go image's GOPATH directory and the PHP image's web root, both mode `1777` in
+their bases; `/run/lock` in every one), and `verifier/test/image_audit.sh` asks the kernel, as
+the unprivileged user, what it can write in the built image: nothing on the runner's or the
+image's `PATH`, nothing the runner executes or reads its configuration from, and nothing
+outside its home, `/tmp`, `/var/tmp`, `/dev/shm` and `/dev/mqueue`. Go's `GOPATH` (and so
+`go install`'s directory) is in the sandbox user's home, which root never puts on a `PATH`.
+
 ## Own limits (second line behind the platform's reaper)
 
 * wall clock: `wall_clock_seconds` minus 30 seconds for the upload. A command that is still
@@ -183,7 +243,7 @@ environment: `env -i` starts it, as root, before it becomes the unprivileged use
   "steps": [
     {"name": "tests", "status": "pass", "duration_ms": 1234, "excerpt": "...", "exit_code": 0, "index": 1}
   ],
-  "runner": {"runtime": "elixir", "version": 2},
+  "runner": {"runtime": "elixir", "version": 3},
   "runner_error": "only when the run could not start"
 }
 ```
@@ -202,6 +262,239 @@ command, by index), nothing failed or hit a limit, and the new test failed befor
 passed after. The runner's own `clone` step proves nothing, and a profile with no `test`
 command is never `verified`: it ends `unverified` with the reason "no test suite
 configured".
+
+## The network rule and the proxy secrets
+
+Whether a repository's commands may reach the network is a setting of the repository on the
+platform (`check_network`, off unless an administrator turns it on). The runner does its
+half of enforcing it by what it hands each command, in three phases:
+
+| phase | commands | what they are given |
+| --- | --- | --- |
+| setup | `setup` | the network: the task definition's proxy variables, or on the hosted verifier the `setup` secret |
+| checks | everything after setup: `check`, `analysis`, `test`, `new_test`, and the baseline of a run or of a session | the network only when the repository's setting allows it |
+
+Setup ends at one point, the same in a run and in a session: after the last `setup` command and
+before any other command (the baseline included), the runner `PUT`s `{}` to `setup_done_url` and
+the platform revokes the `setup` secret there. A session's baseline therefore runs under the
+`checks` rule, never under the `setup` secret.
+
+**Hosted verifier** (`VERIFIER_PROXY_URL` set, and the bootstrap carries `proxy`). The task
+can reach nothing but the egress proxy, and the proxy admits a request only with a secret the
+platform lists as live for the host asked for. The secrets are per run or session, random,
+and stored only as hashes on the platform:
+
+* Before the bootstrap is claimed the runner authenticates to the proxy as `run:<id>` or
+  `session:<id>` (read from its own bootstrap URL, the path
+  `.../verifier/<id>/<signature>/bootstrap` or `.../verifier/sessions/<id>/<signature>/bootstrap`)
+  with the URL's `<signature>` segment as the secret. That reaches the platform host and
+  nothing else.
+* The bootstrap's `proxy` object holds `user`, `runner` and `setup`. The runner's own
+  requests (the clone, every request to the platform) use `user` and `runner`, through
+  `curl --config` and git's environment configuration, never on a command line and never in
+  a command's environment.
+* The proxy settings of a command reach it through a pipe its own shell reads and closes before
+  it runs anything, never as an argument of `env`, `setpriv` or `bash`.
+* `setup` commands get `HTTP_PROXY`, `HTTPS_PROXY` and the lower-case forms set to
+  `http://<user>:<setup>@<host:port>` (percent-encoded), and `NO_PROXY` set to
+  `localhost,127.0.0.1,::1` so a repository's tests still reach the services they start.
+  The platform revokes the `setup` secret when `setup_done_url` is `PUT` (a run and a session
+  alike), which happens before the baseline or any other later command runs, so a setup command
+  that saves it to disk saves a secret that is dead before anything else runs. The runner cannot
+  keep a setup command from writing what it was handed to a place a later command can read (both
+  are the same unprivileged user); revoking it is the control, and the runner does not run another
+  command when the platform did not take the message (a run ends with a `runner_error`, a session
+  is reported on `ready_url` with one).
+* Commands after setup get the same variables with the `checks` secret, which the platform
+  hands over only in the answer to `setup_done_url`, and only when the repository's setting
+  is on. Without it they get no proxy variable at all (not even `NO_PROXY`), and so no way to
+  reach the network. A session bootstrap that carries `proxy` and no `setup_done_url` is
+  refused (reported on `ready_url` as a `runner_error`) before anything is cloned.
+* The proxy secret on the wire is HTTP Basic `Proxy-Authorization`, whose decoded value is
+  `<kind>:<id>:<secret>` with `<kind>` `run` or `session`; the proxy splits at the last
+  colon into the user `<kind>:<id>` and the secret. A secret therefore never contains a colon:
+  every secret the platform mints (`runner`, `setup`, `checks`, and the bootstrap URL's
+  signature) is URL-safe base64 without padding, the characters `A-Z a-z 0-9 - _`.
+* Commands never reach the platform host, whatever the setting; only the runner's own
+  requests do.
+
+**Customer-run verifier** (no `VERIFIER_PROXY_URL`). The customer's network rules decide.
+`setup` commands get the task definition's proxy variables. Commands after setup get them
+only when the bootstrap says `"network": true`; a session bootstrap without the key means
+`false`. The runner cannot stop a command that reaches the network some other way, and
+promises nothing about it. A run bootstrap that has no `network` key at all (a version 2
+platform) keeps the version 2 behaviour: every command gets the proxy variables.
+
+## Session mode (runner version 3)
+
+A session is one container start that serves several jobs for one fix. The platform runs the
+repository's own commands for the fix agent while it works (`run_checks`): the fix is staged
+in a job, the runner restores the tree, writes the job's files and runs the named commands.
+The runner holds only the profile's commands: every job names commands by `index` and `kind` in
+the session's snapshot, and the text the runner executes is the snapshot's, never a job's. A job
+that names an index the snapshot does not hold, or a kind it does not hold for that index, is
+refused; so is a job step that carries a `cmd` that is not the snapshot's text with the
+placeholders below expanded. This amends "one run" above:
+a session task serves one run of one organization and one repository, several jobs, and never
+another run.
+
+The session bootstrap carries `session` instead of `result_url` and `files`:
+
+```json
+{
+  "session": {
+    "ready_url": "one-time PUT for the clone, setup and baseline report",
+    "setup_done_url": "one-time PUT the runner makes once the last setup command has ended",
+    "next_url": "GET, valid until end_at, answers the next job",
+    "end_at": "2026-10-21T12:30:00Z",
+    "idle_seconds": 300,
+    "job_seconds": 300,
+    "setup_seconds": 600
+  },
+  "proxy": {"user": "session:<id>", "runner": "<secret>", "setup": "<secret>"},
+  "network": false,
+  "repo_url": "https://github.com/<owner>/<repo>.git",
+  "repo_token": "a read-only GitHub installation token for this one repository",
+  "base_sha": "the commit to check out",
+  "steps": [{"index": 0, "name": "unit", "kind": "test", "cmd": "mix test"}],
+  "analysis": {"rule_pack": "v1-3fa9c012", "files": {"missing-timeouts.yml": "rules: ..."}}
+}
+```
+
+`repo_url`, `repo_token`, `base_sha`, `steps`, `analysis` and `max_output_bytes` are as in a run
+bootstrap (`steps` is the session's whole command snapshot, at most 12; `analysis` and
+`max_output_bytes` are optional). `base_sha` is required and is a commit id, 40 or 64 lower-case
+hexadecimal characters (a run may omit it and get the repository's `HEAD`, as before; any other
+value is refused with a `runner_error` before git sees it). `end_at` is an ISO 8601 UTC time, and
+the three `_seconds` are whole numbers from 1 to 7200. A bootstrap that is not this shape is
+reported on `ready_url` as a `runner_error` (when `ready_url` itself can be read) and the runner
+exits `0`.
+
+1. **Boot.** One clock, `setup_seconds`, for all of it. The runner clones `base_sha`, runs every
+   `setup` command, `PUT`s `{}` to `setup_done_url` (the network rule, above), runs every `test`
+   command on the unmodified tree (the session's baseline, under the `checks` rule) and `PUT`s
+   the ready report to `ready_url`: the result schema (below) with the clone step,
+   one step per `setup` command, and one step named `baseline` per `test` command, each with
+   the `index` of its command. A red baseline does not end the session (the step says so and
+   `baseline_green` is `false`); a failed `setup` command does: the runner reports it and
+   exits `0`, and runs no job. A clone that fails is a `clone` step with status `error`, a
+   `runner_error`, and the same exit.
+2. **Setup done and the ready answer.** The answer to `setup_done_url` may carry
+   `{"proxy": {"checks": "<secret>"}}` (the network rule); the answer to the ready report carries
+   nothing the runner reads. A session whose `setup_done_url` the platform did not accept is
+   reported on `ready_url` with a `runner_error` and no baseline, and the runner exits `0`. A
+   ready report the platform answers `409` or `410` ends the runner with exit `0`; any other
+   refusal with exit `1`. A one-time `PUT` (the ready report, setup done, a job result) is
+   repeated after two seconds when it got no answer or a `5xx`, three attempts in all; a `409`
+   that answers a repeat is taken as the first attempt having been stored (its answer was lost),
+   and the platform must answer a second use of a one-time URL with `409`, whatever the body.
+   A `409` on a first attempt is a refusal.
+3. **Loop.** `GET next_url?after=<seq of the last job answered>` (`after=0` first), with a
+   timeout of 40 seconds or the time left until `end_at`, whichever is less and at least one
+   second (the platform holds a request up to 20 seconds):
+
+   | next answers | the runner |
+   | --- | --- |
+   | `200` | runs the job |
+   | `204` | asks again, after at least one second |
+   | `410` | the session is over: exits `0` |
+   | `404`, `429`, any `5xx`, no answer | waits 2, 4, 8 and then 20 seconds between attempts, and asks again |
+   | any other answer | exits `1` |
+
+   The runner makes no request after `end_at`, nor after `idle_seconds` without a job (counted
+   from the ready report and from the end of each job), and exits `0` instead of waiting past
+   either. A job it cannot report (no `seq`, no `result_url`, a `seq` not after the last one
+   answered) is skipped and treated like a failed request.
+4. **A job** is `{"seq": 3, "files": [{"path", "content", "test"}], "steps": [{"index",
+   "kind", "cmd"}], "result_url": "one-time PUT"}`. `cmd` is optional; when a step carries it, it
+   must be exactly the text the runner computes (below). Under the job clock (`job_seconds`, and
+   never past `end_at`) the runner:
+   * checks the job: at most 20 files (no path with a line break, `{` or `}`: a brace could spell a
+     placeholder), at most 12 steps, every step an
+     `index` and `kind` of the snapshot, `kind` one of `check`, `analysis`, `test`, `new_test`
+     (`setup` is never rerun), and every `cmd` a string equal to the expansion of the snapshot's
+     command. A refusal is a result with no steps and a `runner_error`, and the session goes on;
+     the job's own text is never run, so a refusal is the only effect it can have;
+   * restores the session to what the end of boot left, as the unprivileged user and with
+     nothing it can write trusted (see "What the restore keeps" below): the whole git directory
+     (configuration, hooks, index, objects, replace refs, alternates, grafts, `HEAD`) is put
+     back from a copy taken right after the clone, the index is rebuilt and every tracked file
+     is written again from the base commit, and every untracked path is removed except the
+     paths `setup` left ignored, which the runner listed once, at ready, and matches by exact
+     name (an ignore rule, attributes file or exclude file a job wrote decides nothing). A job
+     therefore starts from the base commit plus its own files, whatever the previous job
+     edited, committed, staged, ignored or left behind;
+   * writes the job's files with the same path rules as a patch (no absolute path, no `..`,
+     no `.git`, no symbolic link on the way);
+   * runs the job's steps in kind order `check`, `analysis`, `test`, `new_test` (in the job's
+     order within a kind), each as every command runs (unprivileged user, own session, rebuilt
+     environment, ended with everything it started). The text is the snapshot's command with
+     `{touched_files}` replaced by every file of the job and `{test_files}` by the files marked
+     `test`, in the job's order, each path in single quotes with a single quote inside it
+     written `'\''` and separated by one space, and `{rule_pack}` replaced by the bootstrap's
+     `analysis.rule_pack`; every placeholder is replaced in one pass over the snapshot's text, so
+     a replacement is never searched for placeholders again; a command that names a placeholder
+     that would be empty is not run and is reported `skipped`. Each path reaches the command as one
+     single-quoted word, whatever characters it holds (spaces, `$(...)`, `;`, `*`, quotes). The step is reported under the snapshot's `name` for that `index`,
+     with the `index`; `analysis` steps expand `{rules_dir}` as in a run;
+   * `PUT`s the result to `result_url`: the result schema with `runner.version` `3`, steps
+     by `index`, no baseline, no URL and no secret. A result answered `410` ends the runner with
+     exit `0`; any other refusal with exit `1`.
+5. **The end.** The session ends, with the runner exiting `0`, when the platform says `410`, at
+   `end_at`, after `idle_seconds` without a job, after a job in which a command was cut off by
+   the job clock (a `timeout` step; the platform stops the task as well), and when the tree
+   cannot be restored (the result then carries a `runner_error`). Whatever ends a session, no
+   command is left running.
+
+Every URL and secret of a session lives in a mode 0600 file only root can open, like a run's.
+Nothing but the runner's own `curl` and `git` is ever handed one, and on no command line.
+
+### What the restore keeps between two jobs
+
+The restore is the only boundary between two jobs of one session, so it is stated exactly. Every
+command, `setup` included, runs as the same unprivileged user, which owns everything the restore
+reads back. Nothing a job writes is trusted: what is put back comes from copies the runner made
+as root (a copy of the git directory right after the clone, the list of ignored paths and a
+manifest of the places below, both at ready) in a directory the unprivileged user cannot write.
+
+Gone before the next job:
+
+* processes (every one the unprivileged user owns), SysV shared memory, semaphores and message
+  queues;
+* the git directory as the clone left it (a replace ref, `objects/info/alternates`,
+  `info/grafts`, a commit, a stash, a branch, a hook, a configuration entry, a forged or deleted
+  object, a `.git` that was replaced or locked);
+* every tracked path (content, mode, type), every untracked path that is not one of the ignored
+  paths below (nested repositories included), every `.gitattributes`, `.gitignore` or exclude
+  rule a job wrote;
+* in the unprivileged user's home, `TMPDIR` (`$WORK/tmp`, set for every command of a session),
+  `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` and `/dev/mqueue` (and the home of the sandbox user
+  in the image): every file or directory the unprivileged user owns that was not there at ready
+  or is not exactly as it was (path, type, mode, size, mtime and ctime, which a process cannot
+  set). `/run/lock` is mode `1777` in a stock Debian or Ubuntu and `/dev/mqueue` is a mount the
+  container runtime adds, so both are in the list although the images make the first unwritable.
+
+Kept, on purpose, because they are the dependency and build caches that make a session fast:
+
+* the paths `setup` and the baseline left ignored (`git ls-files --others --ignored
+  --exclude-standard --directory`, taken at ready, matched by exact name), **and whatever a job
+  writes inside them**: a later job reads a cache an earlier job changed. The platform's final
+  verification is a fresh clone and never reads them;
+* the files and directories in the home and temporary places above that setup or the baseline
+  left and no job changed. A file a job changed or deleted is not brought back: a changed one is
+  removed, a deleted one stays deleted (the next command refetches or rebuilds it).
+
+**What persists, stated as a whole.** Two kinds of thing persist from one job to the next, and
+both are listed above: the paths `setup` and the baseline left ignored (and whatever a job
+writes inside them), and the files and directories `setup` or the baseline left in the home,
+`TMPDIR`, `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` and `/dev/mqueue` that no job changed.
+Nothing else the unprivileged user can write persists unrestored, because the images leave it
+nothing else to write: the work directory (mode `0711`), the rule pack, the runner's own files
+and every other directory are root's and closed to group and other, which
+`verifier/test/image_audit.sh` checks in every built image. A second mount an operator adds (a
+volume, a `tmpfs`) is the operator's to account for. Separately from persistence, **root never
+executes anything from a place the unprivileged user can write**, restored or not: see "What the
+runner executes".
 
 ## Running it in your own account
 
@@ -236,6 +529,16 @@ to it, as the one environment variable, sized by `size`. From there the runner d
 what it does anywhere: claim the bootstrap once, run, PUT the result. A job nobody collects
 within 15 minutes ends `uncollected` and the pull request opens unverified, with a line
 that says so.
+
+A job may instead be the start of a session: it then carries `"kind": "session"` and its
+`wall_clock_seconds` covers the whole session (1,800). The poller starts the image exactly the
+same way, and the runner serves the session until the platform ends it or the session
+bootstrap's `end_at` (which falls inside `wall_clock_seconds`). A poller is given a session only
+when the platform knows that the image digest it reported for the runtime is one that serves
+sessions (runner version 3); an older digest keeps being given runs. With no
+`VERIFIER_PROXY_URL` the network rule is the customer's own (see above): the task definition's
+proxy variables go to `setup` commands, and to the commands after setup only when the session
+bootstrap says `"network": true`.
 
 Answers: `200` with `data` (jobs) and `refused` (runtimes not given work, each with a
 `code` and a sentence); `401`, `403 insufficient_scope`; `403 feature_not_available` and
@@ -288,7 +591,29 @@ use that wheel.
 image, including that a command sees none of the runner's variables and cannot read the
 runner's `/proc/<pid>/environ`, that a daemon with its own session is dead when its step
 ends, that no URL is on any command line, that the patch is written by the unprivileged
-user and that the runner's own time cap holds.
+user and that the runner's own time cap holds. For session mode it also proves, with the
+same uid separation: that a daemon a job started is dead before the next job; that the next
+job's tree is the base commit as the unprivileged user restores it (an edited tracked file, an
+untracked file, a staged file, a planted git configuration, hook and exclude file, a replace
+ref and a job-made ignore rule gone; an ignored cache kept), and that what a job left in its
+home, `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` and in SysV shared memory is gone while what
+setup left there unchanged stays; that the job clock holds against a command that ignores `SIGTERM`; that
+`setup` never reruns and that a job naming an index outside the snapshot, or carrying a command text
+that is not the snapshot's, is refused and its text never runs; that the
+runner exits on `410` and when idle; that no URL or secret is on any command line (a scanner
+running as root for the whole run looks) or in a command's environment; and, through a local
+proxy that admits only the secrets the platform lists as live, that a job command opening a
+connection to an allowed host fails after setup when the network rule is off and succeeds when it
+is on, and that the secret a `setup` command saved is refused once setup is done, for the
+baseline as for every later command. It also audits every image for places the unprivileged user
+can write (`verifier/test/image_audit.sh`), plants, from a `setup` command, an executable named
+like every program the runner starts in every directory that user can write (and puts a directory
+it made first on the container's `PATH`), and proves that none of them runs as root through the
+boot and two jobs; and it proves that the runner refuses to start when a program it runs as root,
+a directory it looks that program up in, or a link on the way is group or other writable.
+`tests/test_session.py` and `tests/test_session_network.py` run the session cases, and
+`tests/test_root_path.py` the planted-program and ownership cases, and the
+back-off table, against `run.sh` without Docker.
 
 ### The one scanner exception: pip's `pkg_resources` (CVE-2025-47273)
 

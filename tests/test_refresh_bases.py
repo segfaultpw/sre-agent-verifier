@@ -119,6 +119,7 @@ class ContractScriptGoToolchainFloorTest(TempDirCase):
             "  run)\n"
             '    case "$*" in\n'
             '      *"--entrypoint go"*) echo "$GO_VERSION_LINE"; exit 0 ;;\n'
+            '      */audit.sh*) exit 0 ;;\n'
             '      *busybox*) exit 0 ;;\n'
             "    esac\n"
             "    exit 99 ;;\n"

@@ -35,6 +35,26 @@ when one is retired, which one to move to.
 - Each command has a time limit and an output limit, and the whole run has a deadline.
 - The result is sent to a one-time URL and holds no secret.
 
+Since runner version 3 the same image can also run as a **session**: one container start
+and one clone that run your repository's configured commands for several jobs while SRE
+Agent's fix agent works on a fix, until SRE Agent ends the session. Before each job the
+runner puts the git directory, the tree and the unprivileged user's home and temporary
+directories back to what the end of setup left (the paths setup left ignored, such as your
+dependency caches, survive, and so does what a job writes inside them; the contract lists
+exactly what persists), a job can only name commands from the list the session started with
+and the runner runs that list's text, never a job's own, and a command that runs past its job
+clock is ended, with everything it started. After setup, commands reach no network unless the
+repository's setting allows it; on the hosted verifier that is enforced by an egress proxy
+and per-run secrets the platform revokes, on your own verifier your network rules decide.
+Everything a runner of version 2 was given still works with version 3.
+
+The runner is root and a repository's commands are not, so it never executes anything those
+commands could have written: everything it runs as root is looked up on one fixed `PATH`, set
+before its first command and never taken from the image, and it refuses to start (exit `2`)
+when one of those programs, or a directory on the way, can be changed by anyone but root. The
+images ship no directory the commands can write outside their home, `/tmp`, `/var/tmp`,
+`/dev/shm` and `/dev/mqueue`, and `verifier/test/contract.sh` audits that in every image.
+
 The full contract is [`verifier/contract.md`](verifier/contract.md), and the runner is
 [`verifier/run.sh`](verifier/run.sh).
 The platform side keeps a pinned copy of both files and checks it against this repository, so a
@@ -64,8 +84,12 @@ python3 -I -m unittest discover -s tests -v
 ```
 
 They cover the image sources (every base pinned by digest, the pinned inputs of the node and
-python images, the scanner exception), the scripts the Dockerfiles run, and this repository's
-workflow. They need `bash`, `git`, `jq`, `openssl` and `tar`; set
+python images, the scanner exception), the scripts the Dockerfiles run, this repository's
+workflow, and the runner's session mode and network rule (`run.sh` driven against a loopback
+platform and a local proxy, in `tests/test_session.py` and `tests/test_session_network.py`),
+and that the runner never executes a program the repository could have planted
+(`tests/test_root_path.py`).
+They need `bash`, `git`, `jq`, `curl`, `openssl` and `tar`; set
 `VERIFIER_TESTS_REQUIRE_TOOLS=1` to fail instead of skip when one is missing. The publishing
 workflow runs them first, and nothing is built or published when one fails.
 `verifier/test/contract.sh RUNTIME` runs the runner contract inside a real image and needs Docker.
