@@ -473,17 +473,30 @@ build_result() {
 # put_json CONFIG FILE: PUT FILE to the URL in the curl config CONFIG, again after two seconds
 # on a network error or a 5xx (three attempts). Answers 0 for a 2xx; the last HTTP status
 # (000 for none) is left in PUT_CODE and the answer's body in $OUT/response.txt.
+# A 409 on a repeat is a 2xx lost on the way: the URL is one-time, an earlier attempt got no
+# answer (a network error or a 5xx), and the platform answers a second use of the URL with 409,
+# so the first attempt was stored. It is taken as accepted (the answer's body, which may have
+# carried something, is lost with it). A 409 on a first attempt is a refusal.
 PUT_CODE=000
 put_json() {
-  local config=$1 file=$2 attempt
+  local config=$1 file=$2 attempt unanswered=no
   PUT_CODE=000
   for attempt in 1 2 3; do
     PUT_CODE=$(curl -sS --config "$config" -o "$OUT/response.txt" -w '%{http_code}' --max-time 60 \
       -X PUT -H 'content-type: application/json' --data-binary @"$file") || PUT_CODE=000
     case "$PUT_CODE" in
       2??) return 0 ;;
+      409)
+        if [ "$unanswered" = yes ]; then
+          log "the repeated upload was answered 409: the first one was stored"
+          printf '{}' >"$OUT/response.txt"
+          return 0
+        fi
+        return 1
+        ;;
       000 | 5??)
         log "upload attempt $attempt failed ($PUT_CODE)"
+        unanswered=yes
         sleep 2
         ;;
       *) return 1 ;;
@@ -628,8 +641,11 @@ do_clone() {
       n=$((n + 1))
     fi
     export GIT_CONFIG_COUNT=$n
-    timeout -k 5 "$remaining" git fetch -q --depth 1 --no-tags origin "${BASE_SHA:-HEAD}" || exit 1
+    timeout -k 5 "$remaining" git fetch -q --depth 1 --no-tags --end-of-options origin "${BASE_SHA:-HEAD}"
+    fetch_rc=$?
     unset GIT_CONFIG_COUNT auth
+    # The status survives, so a clone the clock cut off (124, or 137 once killed) is reported as that.
+    [ "$fetch_rc" -eq 0 ] || exit "$fetch_rc"
     git checkout -q FETCH_HEAD || exit 1
   ) >"$OUT/clone.log" 2>&1
   clone_rc=$?
@@ -1209,18 +1225,18 @@ handle_job() {
   job_run
 
   build_result "$OUT/job-result.json"
-  put_json "$JOB_RESULT_CONFIG" "$OUT/job-result.json"
-  case "$PUT_CODE" in
-    2??) ;;
-    410)
-      log "the session is over (the result was answered 410)"
-      exit 0
-      ;;
-    *)
-      log "the job's result was not accepted ($PUT_CODE)"
-      exit 1
-      ;;
-  esac
+  if ! put_json "$JOB_RESULT_CONFIG" "$OUT/job-result.json"; then
+    case "$PUT_CODE" in
+      410)
+        log "the session is over (the result was answered 410)"
+        exit 0
+        ;;
+      *)
+        log "the job's result was not accepted ($PUT_CODE)"
+        exit 1
+        ;;
+    esac
+  fi
   rm -f "$JOB_FILE" "$JOB_RESULT_CONFIG" "$OUT"/step-*.log "$INCOMING"/*
   LAST_SEQ=$seq
   IDLE_DEADLINE=$((SECONDS + IDLE_SECONDS))
@@ -1238,7 +1254,7 @@ handle_job() {
 LAST_SEQ=0
 IDLE_DEADLINE=0
 session_loop() {
-  local fails=0 delays=(2 4 8 20) now code started delay
+  local fails=0 delays=(2 4 8 20) now code started delay wait_for
   IDLE_DEADLINE=$((SECONDS + IDLE_SECONDS))
   while :; do
     printf -v now '%(%s)T' -1
@@ -1253,7 +1269,12 @@ session_loop() {
     with_query "$NEXT_URL" "after=$LAST_SEQ"
     if ! curl_config "$NEXT_CONFIG" "$REPLY"; then exit 1; fi
     started=$SECONDS
-    code=$(curl -sS --config "$NEXT_CONFIG" -o "$JOB_FILE" -w '%{http_code}' --max-time 40) || code=000
+    # The platform holds the request up to 20 seconds; never past the end time.
+    printf -v now '%(%s)T' -1
+    wait_for=$((END_EPOCH - now))
+    if [ "$wait_for" -gt 40 ]; then wait_for=40; fi
+    if [ "$wait_for" -lt 1 ]; then wait_for=1; fi
+    code=$(curl -sS --config "$NEXT_CONFIG" -o "$JOB_FILE" -w '%{http_code}' --max-time "$wait_for") || code=000
     case "$code" in
       200)
         if handle_job; then
@@ -1299,7 +1320,7 @@ SESSION_VALID='
   and ([.session.idle_seconds, .session.job_seconds, .session.setup_seconds]
        | all(type == "number" and . >= 1 and . <= 7200 and . == floor))
   and ((.repo_url | type) == "string")
-  and ((.base_sha | type) == "string") and (.base_sha | length > 0)
+  and ((.base_sha | type) == "string") and (.base_sha | test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
   and ((.steps | type) == "array") and (.steps | length <= 12)
   and all(.steps[]; (type == "object") and (.index | type == "number" and . >= 0 and . == floor)
        and ((.name | type) == "string") and (.kind | IN("setup", "check", "analysis", "test", "new_test"))
@@ -1508,6 +1529,11 @@ DEADLINE=$((WALL_CLOCK_SECONDS - 30))
 if [ -n "$RUNNER_ERROR" ]; then fail_run "$RUNNER_ERROR"; fi
 if [ -z "$REPO_URL" ]; then fail_run "the bootstrap named no repository"; fi
 if ! rules_valid; then fail_run "the bootstrap's rule pack is not what the contract says"; fi
+# A run may name no commit (the repository's HEAD, as version 2 did); one it names is a commit id,
+# never a value git could read as an option.
+if [ -n "$BASE_SHA" ] && ! [[ "$BASE_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+  fail_run "the bootstrap's base_sha is not a commit id"
+fi
 
 if ! do_clone; then fail_run "the repository could not be cloned"; fi
 

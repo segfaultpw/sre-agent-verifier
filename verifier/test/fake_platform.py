@@ -146,11 +146,15 @@ class Platform:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def _send(self, status, body=b"{}"):
-                self.send_response(status)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    # the runner gave up on a held request (its own time limit): not an error here
+                    pass
 
             def _json(self, status, value):
                 self._send(status, json.dumps(value).encode())

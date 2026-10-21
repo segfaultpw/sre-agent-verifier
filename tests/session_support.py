@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 import shutil
+import socket
 import socketserver
 import subprocess
 import sys
@@ -162,6 +163,31 @@ class GitHttpServer:
     def stop(self):
         self._server.shutdown()
         self._server.server_close()
+
+
+class HangingServer:
+    """Accepts connections and never answers: a repository server that has hung."""
+
+    def __init__(self):
+        self._sock = socket.socket()
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self.port = self._sock.getsockname()[1]
+        self._held = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            self._held.append(conn)
+
+    def stop(self):
+        self._sock.close()
+        for conn in self._held:
+            conn.close()
 
 
 def have_git_http_backend():
@@ -345,10 +371,12 @@ class SessionCase(TempDirCase):
 
 
 __all__ = [
+    "HangingServer",
     "RUN_PATH",
     "SESSION_PATH",
     "SessionCase",
     "have_git_http_backend",
+    "iso",
     "job",
     "make_origin",
     "missing_tools",

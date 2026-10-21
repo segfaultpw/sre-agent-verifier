@@ -123,7 +123,8 @@ Command names are `[a-z][a-z0-9_]{0,39}` and never `baseline`, `new_test_fails_b
    root-owned staging directory nobody else can reach. The token (and, on the hosted
    verifier, the proxy and its secret) is given to that one command through git's
    environment configuration, so it is written to no file and no git config and is on no
-   command line. The fetch is held to the run's clock. The tree is then handed to the
+   command line. The fetch is held to the run's clock; one the clock cuts off is a `clone` step with status
+   `error` and the excerpt "the clone was cut off by the clock". The tree is then handed to the
    unprivileged user and moved into place with one rename: root never writes inside a
    directory that user can write. Step `clone`.
 4. Checks every path in the patch again (no absolute path, no `..`, no `.git`, no doubled
@@ -278,7 +279,9 @@ and stored only as hashes on the platform:
   refused (reported on `ready_url` as a `runner_error`) before anything is cloned.
 * The proxy secret on the wire is HTTP Basic `Proxy-Authorization`, whose decoded value is
   `<kind>:<id>:<secret>` with `<kind>` `run` or `session`; the proxy splits at the last
-  colon into the user `<kind>:<id>` and the secret.
+  colon into the user `<kind>:<id>` and the secret. A secret therefore never contains a colon:
+  every secret the platform mints (`runner`, `setup`, `checks`, and the bootstrap URL's
+  signature) is URL-safe base64 without padding, the characters `A-Z a-z 0-9 - _`.
 * Commands never reach the platform host, whatever the setting; only the runner's own
   requests do.
 
@@ -327,7 +330,9 @@ The session bootstrap carries `session` instead of `result_url` and `files`:
 
 `repo_url`, `repo_token`, `base_sha`, `steps`, `analysis` and `max_output_bytes` are as in a run
 bootstrap (`steps` is the session's whole command snapshot, at most 12; `analysis` and
-`max_output_bytes` are optional). `base_sha` is required. `end_at` is an ISO 8601 UTC time, and
+`max_output_bytes` are optional). `base_sha` is required and is a commit id, 40 or 64 lower-case
+hexadecimal characters (a run may omit it and get the repository's `HEAD`, as before; any other
+value is refused with a `runner_error` before git sees it). `end_at` is an ISO 8601 UTC time, and
 the three `_seconds` are whole numbers from 1 to 7200. A bootstrap that is not this shape is
 reported on `ready_url` as a `runner_error` (when `ready_url` itself can be read) and the runner
 exits `0`.
@@ -346,9 +351,14 @@ exits `0`.
    nothing the runner reads. A session whose `setup_done_url` the platform did not accept is
    reported on `ready_url` with a `runner_error` and no baseline, and the runner exits `0`. A
    ready report the platform answers `409` or `410` ends the runner with exit `0`; any other
-   refusal with exit `1`.
+   refusal with exit `1`. A one-time `PUT` (the ready report, setup done, a job result) is
+   repeated after two seconds when it got no answer or a `5xx`, three attempts in all; a `409`
+   that answers a repeat is taken as the first attempt having been stored (its answer was lost),
+   and the platform must answer a second use of a one-time URL with `409`, whatever the body.
+   A `409` on a first attempt is a refusal.
 3. **Loop.** `GET next_url?after=<seq of the last job answered>` (`after=0` first), with a
-   timeout of 40 seconds (the platform holds a request up to 20 seconds):
+   timeout of 40 seconds or the time left until `end_at`, whichever is less and at least one
+   second (the platform holds a request up to 20 seconds):
 
    | next answers | the runner |
    | --- | --- |
