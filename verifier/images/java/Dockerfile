@@ -3,7 +3,7 @@
 # own wrapper). Build with the verifier/ directory as the context:
 #   docker build -f verifier/images/java/Dockerfile verifier/
 # The base is pinned by the digest of the multi-arch index (amd64 and arm64).
-FROM maven:3-eclipse-temurin-21@sha256:d23342b1a070a07555f4ef20c085a81aa40e5f5b3288ebf8ddae2f67e9d760c8
+FROM maven:3-eclipse-temurin-25@sha256:9b5f82b7166db6112eb123ba310a9e010ec3fe95022ac0728f491121563dfbab
 
 ENV DEBIAN_FRONTEND=noninteractive
 # The Ubuntu base ships Canonical's pebble service manager at /usr/bin/pebble, a Go binary no
