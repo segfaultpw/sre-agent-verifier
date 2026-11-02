@@ -46,11 +46,18 @@ jobs:
       # A runner that lost one of the tools the tests drive fails the run instead of
       # skipping the tests that need it.
       VERIFIER_TESTS_REQUIRE_TOOLS: "1"
+      # Where a checkout of the platform repository is, when the runner has one (a repository
+      # variable). The platform's repository is private, so a run without it skips the check below.
+      PLATFORM_CORPUS_PATH: ${{ vars.PLATFORM_CORPUS_PATH }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Standard-library unit tests for the images, the scripts and this workflow
         run: python3 -I -m unittest discover -s tests -v
+
+      - name: Shared fixture corpus matches the platform's (skipped without a platform path)
+        if: ${{ env.PLATFORM_CORPUS_PATH != '' }}
+        run: bash verifier/sync-fixtures.sh --check "$PLATFORM_CORPUS_PATH"
 
   image:
     name: ${{ matrix.runtime }} ${{ matrix.arch }}

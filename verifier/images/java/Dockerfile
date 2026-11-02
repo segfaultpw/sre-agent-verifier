@@ -30,6 +30,13 @@ RUN --mount=type=bind,source=images/java/fix-maven-bundled.sh,target=/tmp/fix-ma
     bash /tmp/fix-maven-bundled.sh \
       --min com.google.guava:guava@33.7.2-jre=b530942257fb935f8b2cfaa5f8eb5bd59c555fd8e8d01b8ce98912e077ea606c
 
+# semgrep, for the runner's scan mode and a repository profile's `analysis` commands: a pinned,
+# hash-checked install under /opt/semgrep with its own standalone Python (python-standalone.lock,
+# semgrep.lock; see the script's header), `/usr/local/bin/semgrep` a root-owned wrapper. Nothing
+# is fetched when it runs, and it parses files without running them.
+RUN --mount=type=bind,source=semgrep,target=/tmp/semgrep-install \
+    bash /tmp/semgrep-install/install-semgrep.sh --python 3.13.16+20261013 --semgrep 1.183.0
+
 # No directory the unprivileged user can write may be one root executes from or has on its PATH
 # (the runner is root, the repository's commands are not): the base's own world-writable
 # directories lose their write bits. verifier/test/image_audit.sh proves it in the built image.

@@ -27,7 +27,7 @@
 #     directory the command made; and the runner refuses to start when a program it runs as root,
 #     or a directory it looks it up in, can be changed by group or other.
 #
-# Session mode (runner version 3), with the same uid separation:
+# Session mode (runner version 3 on), with the same uid separation:
 #
 #   * a daemon a job starts is dead before the next job, and the next job's tree is the base
 #     commit (a tracked file edited, an untracked file, a staged file, a planted git
@@ -45,6 +45,19 @@
 #     setup when the session says off and succeeds when on, the secret a setup command saved
 #     is refused once setup is done (for the baseline, which runs right after setup, as
 #     for every later command), and no secret is in a job command's environment.
+#
+# Scan mode (runner version 4) and semgrep, with the real tool in every image:
+#
+#   * the platform's shared corpus of rule fixtures, once verifier/sync-fixtures.sh has copied it
+#     here: every class's rule flags each positive fixture and no negative one;
+#   * semgrep is the pinned release, owned by root and unwritable by the unprivileged user, adds no
+#     `python3` to the PATH, and runs as that user on a read-only tree with no network, finding what
+#     a rule says and nothing else; code planted in the scanned tree (a module named like one
+#     semgrep imports, a conftest, a setup.py) is never imported or run;
+#   * a scan bootstrap run end to end: the findings come back in the documented shape with the
+#     matched lines, a rule with an autofix changes no file, the work tree is exactly the commit
+#     afterwards, the platform was told the clone was over before semgrep started, no URL or secret
+#     is on any command line, and a rule pack semgrep refuses is a runner error, not a clean scan.
 #
 # The go image also has a toolchain floor: Go 1.26.10 or later (the release that fixes the
 # standard library advisories the scan reported), checked with `go version` in the image.
@@ -174,7 +187,7 @@ expect_all_pass() {
   fi
 }
 
-# session_cases TAG TMP SHA: runner version 3's session mode inside the image, with the real
+# session_cases TAG TMP SHA: the runner's session mode (version 3 on) inside the image, with the real
 # uid separation, against the fixture repository in $TMP/origin.
 session_cases() {
   local tag=$1 tmp=$2 sha=$3
@@ -220,7 +233,7 @@ session_cases() {
   # /run/lock is made writable for this case (the images make it unwritable, and a runtime may not).
   run_session "$tag" "$tmp" "$port" "$scenario" "$results" -e "VERIFIER_TEST_PRELUDE=chmod 1777 /run/lock"
   expect_all_pass "$results/ready.json" "the session boot"
-  jq -e '.baseline_green == true and .runner.version == 3' "$results/ready.json" >/dev/null || fail "the ready report is not green, version 3"
+  jq -e '.baseline_green == true and .runner.version == 4' "$results/ready.json" >/dev/null || fail "the ready report is not green, version 4"
   expect_all_pass "$results/result-1.json" "job 1"
   expect_all_pass "$results/result-2.json" "job 2 (a daemon from job 1 dead, the tree restored as the base commit)"
   expect_all_pass "$results/result-4.json" "job 4 (setup did not rerun)"
@@ -422,6 +435,217 @@ trust_cases() {
       fail "the runner started although: $breakage"
     fi
   done
+}
+
+# semgrep_cases RUNTIME TAG TMP: the installed tool, as the unprivileged user, on a read-only tree
+# with no network at all.
+semgrep_cases() {
+  local runtime=$1 tag=$2 tmp=$3 pinned fixture out
+  pinned=$(sed -n 's/.*--semgrep \([0-9][0-9.]*\).*/\1/p' "$here/images/$runtime/Dockerfile")
+  [ -n "$pinned" ] || fail "the $runtime Dockerfile pins no semgrep release"
+
+  out=$(docker run --rm --network none --user 10001:10001 --entrypoint semgrep "$tag" --version | tail -n 1) ||
+    fail "semgrep --version failed as the unprivileged user in the $runtime image"
+  [ "$out" = "$pinned" ] || fail "the $runtime image has semgrep $out, not the pinned $pinned"
+
+  # root's, closed to the unprivileged user, and no new interpreter or installer on the PATH
+  docker run --rm --network none --user 10001:10001 --entrypoint sh "$tag" -c '
+    no() { if "$@"; then echo "unexpected: $*" >&2; exit 1; fi; }
+    [ "$(stat -c "%u:%g %a" /usr/local/bin/semgrep)" = "0:0 755" ] || exit 1
+    [ "$(stat -c "%u:%g" /opt/semgrep /opt/semgrep/python /opt/semgrep/python/bin/python3)" = "$(printf "0:0\n0:0\n0:0")" ] || exit 1
+    no test -w /usr/local/bin/semgrep
+    no test -w /opt/semgrep
+    no test -w /opt/semgrep/python/bin
+    no test -w /opt/semgrep/python/lib/python3.13/site-packages
+    no test -w /opt/semgrep/python/lib/python3.13/site-packages/semgrep/bin/semgrep-core
+    no test -e /opt/semgrep/python/bin/pip
+    no test -e /opt/semgrep/python/lib/python3.13/site-packages/pip
+    writable=$(find /opt/semgrep \( -type d -o -type f \) -perm /022 | head -n 1)
+    [ -z "$writable" ] || { echo "group or other can write $writable" >&2; exit 1; }
+    case "$(command -v python3 || true)" in /opt/semgrep*) exit 1 ;; esac
+  ' || fail "the semgrep install in the $runtime image is writable by the unprivileged user, still has pip, or put its Python on the PATH"
+
+  fixture="$tmp/semgrep-fixture"
+  mkdir -p "$fixture/rules" "$fixture/repo"
+  cat >"$fixture/rules/fixture.yml" <<'RULES'
+rules:
+  - id: sre-fixture-requests-timeout
+    languages: [python]
+    severity: WARNING
+    message: requests call without a timeout
+    pattern: requests.get($URL)
+  - id: sre-fixture-requests-fix
+    languages: [python]
+    severity: WARNING
+    message: requests post without a timeout
+    pattern: requests.post($URL)
+    fix: requests.post($URL, timeout=10)
+RULES
+  printf 'import requests\nrequests.get("http://x")\nrequests.post("http://y")\n' >"$fixture/repo/bad.py"
+  printf 'import requests\nrequests.get("http://x", timeout=3)\n' >"$fixture/repo/good.py"
+  # Code in the tree that would run if semgrep imported a module from its working directory or
+  # executed a file it reads: each leaves a marker in /tmp.
+  for module in json click yaml sitecustomize semgrep; do
+    printf 'open("/tmp/planted-import-%s", "w").close()\n' "$module" >"$fixture/repo/$module.py"
+  done
+  printf 'open("/tmp/planted-conftest", "w").close()\n' >"$fixture/repo/conftest.py"
+  printf 'open("/tmp/planted-setup", "w").close()\n' >"$fixture/repo/setup.py"
+  chmod -R a+rX "$fixture"
+
+  out=$(docker run --rm --network none --user 10001:10001 -e HOME=/home/sandbox -v "$fixture:/fixture:ro" -w /fixture/repo \
+    --entrypoint sh "$tag" -c '
+      semgrep scan --config /fixture/rules --json --quiet --metrics=off --timeout 30 --max-target-bytes 1000000 \
+        --disable-version-check --oss-only --no-rewrite-rule-ids . 2>/tmp/semgrep.err || { cat /tmp/semgrep.err >&2; exit 1; }
+      if ls /tmp/planted-* >/dev/null 2>&1; then echo "planted code ran: $(ls /tmp/planted-*)" >&2; exit 1; fi
+    ') || fail "semgrep failed in the $runtime image on a read-only tree with no network, or ran code from the tree"
+  jq -e '
+    ([.results[] | "\(.check_id) \(.path) \(.start.line)"] | sort)
+      == ["sre-fixture-requests-fix bad.py 3", "sre-fixture-requests-timeout bad.py 2"]
+    and (.paths.scanned | index("good.py") != null)' <<<"$out" >/dev/null || {
+    jq . <<<"$out" >&2
+    fail "semgrep did not find exactly the two matches of the fixture in the $runtime image"
+  }
+}
+
+# run_scan TAG TMP PORT SCENARIO RESULTS: the loopback platform on PORT in scenario mode, the image
+# run once against a scan bootstrap with $TMP/scan-origin mounted as the repository, and a
+# scanner running as root for the whole run (as in run_session). The platform's records are in
+# RESULTS (result.json, setup_done.json, events.jsonl); what the container saw is in
+# RESULTS/scan: `found` (command lines holding a URL or a secret), `status` (the work tree
+# afterwards) and `head` (the commit it is on).
+run_scan() {
+  local tag=$1 tmp=$2 port=$3 scenario=$4 results=$5
+  mkdir -p "$results/scan"
+  : >"$results/events.jsonl"
+  python3 "$here/test/fake_platform.py" --scenario "$scenario" --port "$port" --results "$results" --log "$results/events.jsonl" &
+  server_pid=$!
+  sleep 1
+  docker run --rm --network host \
+    -v "$tmp/scan-origin:/origin:ro" -v "$results/scan:/scan" \
+    -e "BOOTSTRAP_URL=http://127.0.0.1:$port/webhooks/verifier/r1/SIGSECRET/bootstrap" \
+    -e "AWS_SECRET_ACCESS_KEY=leak-aws" \
+    --entrypoint /bin/sh "$tag" -c '
+      ( while :; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr "\000" "\n" | grep -a -e "127[.]0[.]0[.]1:" -e "ghs_contrac[t]" -e "SIGSECRE[T]" -e "leak-aw[s]" >>/scan/found; sleep 0.01; done ) >/dev/null 2>&1 &
+      /usr/local/bin/verifier-run
+      rc=$?
+      git -c safe.directory="*" -C /work/repo status --porcelain=v1 --ignored --untracked-files=all >/scan/status 2>&1
+      git -c safe.directory="*" -C /work/repo rev-parse HEAD >/scan/head 2>&1
+      exit $rc' || fail "the runner exited non-zero on a scan"
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  server_pid=""
+  if [ -s "$results/scan/found" ]; then
+    cat "$results/scan/found" >&2
+    fail "the scanner saw a URL or a secret of the scan on a command line"
+  fi
+}
+
+# scan_cases TAG TMP: runner version 4's scan mode, with the real semgrep.
+scan_cases() {
+  local tag=$1 tmp=$2
+  local origin="$tmp/scan-origin" sha rules results scenario port
+  mkdir -p "$origin/lib"
+  printf 'import requests\nrequests.get("http://x")\nrequests.post("http://y")\n' >"$origin/lib/bad.py"
+  printf 'import requests\nrequests.get("http://x", timeout=3)\n' >"$origin/lib/good.py"
+  printf 'cache/\n' >"$origin/.gitignore"
+  git -C "$origin" init -q -b main
+  git -C "$origin" add -A
+  git -C "$origin" -c user.email=t@t -c user.name=t commit -q -m base
+  sha=$(git -C "$origin" rev-parse HEAD)
+  docker run --rm -v "$origin:/o" busybox chown -R 0:0 /o >/dev/null
+
+  rules=$(cat <<'RULES'
+rules:
+  - id: sre-fixture-requests-timeout
+    languages: [python]
+    severity: WARNING
+    message: requests call without a timeout
+    pattern: requests.get($URL)
+  - id: sre-fixture-requests-fix
+    languages: [python]
+    severity: WARNING
+    message: requests post without a timeout
+    pattern: requests.post($URL)
+    fix: requests.post($URL, timeout=10)
+RULES
+)
+  results=$(mktemp -d -p "$tmp")
+  scenario="$results/scenario.json"
+  port=$((20000 + RANDOM % 20000))
+  jq -n --arg sha "$sha" --arg rules "$rules" '{
+    bootstrap: {
+      mode: "scan", repo_url: "file:///origin", repo_token: "ghs_contract_read_only_token", base_sha: $sha,
+      result_url: "http://127.0.0.1:@PORT@/scan/result", setup_done_url: "http://127.0.0.1:@PORT@/scan/setup_done",
+      wall_clock_seconds: 300, max_output_bytes: 100000,
+      analysis: {rule_pack: "v1-contract", files: {"fixture.yml": $rules}}}}' >"$scenario"
+  run_scan "$tag" "$tmp" "$port" "$scenario" "$results"
+
+  [ -s "$results/result.json" ] || fail "no scan result was uploaded"
+  jq -e '
+    .schema == 1 and .runner.version == 4 and (has("runner_error") | not) and .truncated == false
+    and .files_scanned == 2
+    and ((.findings | map([.rule_id, .path, .start_line, .end_line, .text, .message]) | sort)
+         == ([["sre-fixture-requests-timeout", "lib/bad.py", 2, 2, "requests.get(\"http://x\")\n", "requests call without a timeout"],
+              ["sre-fixture-requests-fix", "lib/bad.py", 3, 3, "requests.post(\"http://y\")\n", "requests post without a timeout"]] | sort))
+    and (.findings | all(keys == ["end_line", "message", "path", "rule_id", "start_line", "text"]))' "$results/result.json" >/dev/null || {
+    jq . "$results/result.json" >&2
+    fail "the scan result is not the documented shape with the two findings"
+  }
+  [ ! -s "$results/scan/status" ] || {
+    cat "$results/scan/status" >&2
+    fail "the scan left the work tree different from the commit (a rule with a fix must not be applied)"
+  }
+  [ "$(cat "$results/scan/head")" = "$sha" ] || fail "the scan did not check out the pinned commit"
+  [ -s "$results/setup_done.json" ] || fail "the platform was never told the clone was over"
+  jq -e -s '[.[] | select(.method == "PUT") | .path | split("/") | last] == ["setup_done", "result"]' "$results/events.jsonl" >/dev/null || {
+    jq -s . "$results/events.jsonl" >&2
+    fail "the end-of-clone message did not come before the result"
+  }
+  if grep -q 'ghs_contract_read_only_token\|leak-aws\|127.0.0.1\|SIGSECRET\|/origin' "$results/result.json"; then
+    fail "a secret or a path leaked into the scan result"
+  fi
+
+  # A rule pack semgrep refuses is a runner error and no findings, never a clean scan.
+  results=$(mktemp -d -p "$tmp")
+  scenario="$results/scenario.json"
+  port=$((20000 + RANDOM % 20000))
+  jq -n --arg sha "$sha" '{
+    bootstrap: {
+      mode: "scan", repo_url: "file:///origin", repo_token: "ghs_contract_read_only_token", base_sha: $sha,
+      result_url: "http://127.0.0.1:@PORT@/scan/result", setup_done_url: "http://127.0.0.1:@PORT@/scan/setup_done",
+      wall_clock_seconds: 300,
+      analysis: {rule_pack: "v1-broken", files: {"broken.yml": "rules:\n  - id: sre-broken\n    languages: [python]\n    pattern: \"(\"\n"}}}}' >"$scenario"
+  run_scan "$tag" "$tmp" "$port" "$scenario" "$results"
+  jq -e '(.runner_error | test("semgrep failed \\(exit [0-9]+\\)")) and .findings == [] and .files_scanned == 0' "$results/result.json" >/dev/null || {
+    jq . "$results/result.json" >&2
+    fail "a rule pack semgrep refuses was not reported as a runner error"
+  }
+}
+
+# corpus_cases TAG: the platform's shared static analysis corpus (verifier/test/corpus, copied by
+# verifier/sync-fixtures.sh): for every class, semgrep with the class's rule file flags every
+# fixture under positive/ and none under negative/, in the image, as the unprivileged user.
+# Skipped, with a line saying so, while the platform has not published a corpus.
+corpus_cases() {
+  local tag=$1 corpus="$here/test/corpus" rules class out positives found missing flagged
+  if ! compgen -G "$corpus/rules/*.yml" >/dev/null; then
+    echo "no shared fixture corpus yet ($corpus has no rules): corpus cases skipped"
+    return 0
+  fi
+  for rules in "$corpus"/rules/*.yml; do
+    class=$(basename "$rules" .yml)
+    out=$(docker run --rm --network none --user 10001:10001 -e HOME=/home/sandbox -v "$corpus:/corpus:ro" -w /corpus \
+      --entrypoint semgrep "$tag" scan --config "rules/$class.yml" --json --quiet --metrics=off --timeout 30 \
+      --max-target-bytes 1000000 --disable-version-check --oss-only --no-rewrite-rule-ids "fixtures/$class") ||
+      fail "semgrep failed on the $class fixtures"
+    positives=$(cd "$corpus" && find "fixtures/$class/positive" -type f | sort)
+    found=$(jq -r '.results[].path' <<<"$out" | sort -u)
+    missing=$(comm -23 <(printf '%s\n' "$positives") <(printf '%s\n' "$found"))
+    [ -z "$missing" ] || fail "the $class rule flags none of these positive fixtures: $missing"
+    flagged=$(grep "^fixtures/$class/negative/" <<<"$found" || true)
+    [ -z "$flagged" ] || fail "the $class rule flags these negative fixtures: $flagged"
+  done
+  echo "ok: the shared corpus ($(find "$corpus/rules" -name '*.yml' | wc -l) classes)"
 }
 
 for runtime in "${runtimes[@]}"; do
@@ -689,6 +913,9 @@ sleep 0.5'
   network_cases "$tag" "$tmp" "$sha"
   root_exec_cases "$tag" "$tmp" "$sha"
   trust_cases "$tag"
+  semgrep_cases "$runtime" "$tag" "$tmp"
+  scan_cases "$tag" "$tmp"
+  corpus_cases "$tag"
 
   echo "ok: $runtime"
 done

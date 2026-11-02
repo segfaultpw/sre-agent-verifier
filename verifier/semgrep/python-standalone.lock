@@ -1,0 +1,12 @@
+# The CPython that runs semgrep in every image: python-build-standalone's `install_only_stripped`
+# build for glibc Linux, one file per architecture, with the sha256 its release publishes in
+# SHA256SUMS (https://github.com/astral-sh/python-build-standalone/releases). It is installed
+# under /opt/semgrep, away from the image's own Python (which some images do not have at all),
+# so a repository's commands see no new `python3` on their PATH.
+#
+# Format: `<sha256>  <file name>`. install-semgrep.sh --python VERSION+TAG looks the file up by
+# name for the machine it runs on and refuses a download whose digest is not the listed one.
+# To bump it, see 'Bumping semgrep' in verifier/contract.md.
+#
+69a30ed26198178732c37b8de0b6b5191479fbacfe526954da776befe38f18e7  cpython-3.13.16+20261013-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+d0080766b6b74aeb81e1949ef0d9a20e6c17f7b160fb295a69b936ccb17660be  cpython-3.13.16+20261013-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz

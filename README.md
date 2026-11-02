@@ -48,6 +48,14 @@ repository's setting allows it; on the hosted verifier that is enforced by an eg
 and per-run secrets the platform revokes, on your own verifier your network rules decide.
 Everything a runner of version 2 was given still works with version 3.
 
+Since runner version 4 the same image can also run a **scan**: one clone of a repository at a
+pinned commit, [semgrep](https://semgrep.dev) run over it with SRE Agent's static analysis rules,
+and the findings reported once. A scan runs none of your repository's commands (semgrep parses
+files and runs none of them), it runs as the same unprivileged user with no network at all, the
+clone token is revoked before semgrep starts, and nothing is written back to the repository.
+semgrep is in every image, installed from hash-locked files (`verifier/semgrep/`), with its own
+Python under `/opt/semgrep` that your repository's commands do not see.
+
 The runner is root and a repository's commands are not, so it never executes anything those
 commands could have written: everything it runs as root is looked up on one fixed `PATH`, set
 before its first command and never taken from the image, and it refuses to start (exit `2`)
@@ -88,7 +96,9 @@ python images, the scanner exception), the scripts the Dockerfiles run, this rep
 workflow, and the runner's session mode and network rule (`run.sh` driven against a loopback
 platform and a local proxy, in `tests/test_session.py` and `tests/test_session_network.py`),
 and that the runner never executes a program the repository could have planted
-(`tests/test_root_path.py`).
+(`tests/test_root_path.py`), and scan mode (`tests/test_scan.py`), the semgrep install
+(`tests/test_semgrep.py`) and the copy of the platform's shared rule fixtures
+(`tests/test_sync_fixtures.py`).
 They need `bash`, `git`, `jq`, `curl`, `openssl` and `tar`; set
 `VERIFIER_TESTS_REQUIRE_TOOLS=1` to fail instead of skip when one is missing. The publishing
 workflow runs them first, and nothing is built or published when one fails.

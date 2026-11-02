@@ -1,4 +1,4 @@
-"""Session mode (runner version 3), driven through verifier/run.sh against a loopback platform.
+"""Session mode (runner version 3, served by every later runner), driven through verifier/run.sh against a loopback platform.
 
 Runs the real runner as an unprivileged process (VERIFIER_ALLOW_UNPRIVILEGED=1), so what it
 cannot show is the uid separation and the uid-wide kill; verifier/test/contract.sh proves
@@ -27,13 +27,13 @@ FILES = [("calc.sh", "echo 4\n", False), ("test_new.sh", 'test "$(sh calc.sh)" =
 
 @runner_tools
 class SessionTest(SessionCase):
-    def test_bootstrap_asks_for_runner_3(self):
+    def test_bootstrap_asks_for_runner_4(self):
         platform, done = self.run_scenario(self.session_scenario(SNAPSHOT, []))
         self.assertRunnerOk(done)
         queries = [e["query"] for e in platform.requests("GET", "/bootstrap")]
-        self.assertEqual(queries, ["runner=3"])
+        self.assertEqual(queries, ["runner=4"])
 
-    def test_run_bootstrap_asks_for_runner_3_and_is_unchanged(self):
+    def test_run_bootstrap_asks_for_runner_4_and_is_unchanged(self):
         scenario = {
             "bootstrap": {
                 "repo_url": self.repo_url(),
@@ -53,7 +53,7 @@ class SessionTest(SessionCase):
         }
         platform, done = self.run_scenario(scenario, path=RUN_PATH)
         self.assertRunnerOk(done)
-        self.assertEqual([e["query"] for e in platform.requests("GET", "/bootstrap")], ["runner=3"])
+        self.assertEqual([e["query"] for e in platform.requests("GET", "/bootstrap")], ["runner=4"])
         result = platform.body("result.json")
         self.assertEqual(
             [s["name"] for s in result["steps"]],
@@ -61,7 +61,7 @@ class SessionTest(SessionCase):
         )
         self.assertAllPass(result)
         self.assertEqual(sorted(result), ["baseline_green", "runner", "schema", "steps"])
-        self.assertEqual(result["runner"], {"runtime": "node", "version": 3})
+        self.assertEqual(result["runner"], {"runtime": "node", "version": 4})
         self.assertTrue(result["baseline_green"])
         self.assertEqual(platform.requests("PUT", "/ready"), [])
 
@@ -77,7 +77,7 @@ class SessionTest(SessionCase):
         self.assertEqual([(s["name"], s.get("index")) for s in ready["steps"]], [("clone", None), ("deps", 0), ("baseline", 1)])
         self.assertAllPass(ready)
         self.assertTrue(ready["baseline_green"])
-        self.assertEqual(ready["runner"], {"runtime": "node", "version": 3})
+        self.assertEqual(ready["runner"], {"runtime": "node", "version": 4})
 
         first = self.result(1)
         self.assertEqual(
@@ -86,7 +86,7 @@ class SessionTest(SessionCase):
             "steps run in kind order: check, analysis, test, new_test",
         )
         self.assertAllPass(first)
-        self.assertEqual(first["runner"]["version"], 3)
+        self.assertEqual(first["runner"]["version"], 4)
         second = self.result(2)
         self.assertEqual([(s["name"], s["index"]) for s in second["steps"]], [("lint", 2), ("unit", 1)])
         self.assertAllPass(second)

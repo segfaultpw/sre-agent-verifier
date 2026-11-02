@@ -27,6 +27,13 @@ RUN --mount=type=bind,source=images/python,target=/tmp/pip-fix \
       --min msgpack==1.2.3 \
       --build-from-sdist msgpack
 
+# semgrep, for the runner's scan mode and a repository profile's `analysis` commands: a pinned,
+# hash-checked install under /opt/semgrep with its own standalone Python (python-standalone.lock,
+# semgrep.lock; see the script's header), `/usr/local/bin/semgrep` a root-owned wrapper. Nothing
+# is fetched when it runs, and it parses files without running them.
+RUN --mount=type=bind,source=semgrep,target=/tmp/semgrep-install \
+    bash /tmp/semgrep-install/install-semgrep.sh --python 3.13.16+20261013 --semgrep 1.183.0
+
 # No directory the unprivileged user can write may be one root executes from or has on its PATH
 # (the runner is root, the repository's commands are not): the base's own world-writable
 # directories lose their write bits. verifier/test/image_audit.sh proves it in the built image.

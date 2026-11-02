@@ -2,6 +2,8 @@
 # The verifier runner. One run, one repository, one patch, then it exits. Version 3 adds
 # session mode: the same image can also serve a sequence of jobs for one fix, over one
 # clone, until the platform ends the session (see "Session mode" in verifier/contract.md).
+# Version 4 adds scan mode: one clone at a pinned commit, the platform's rule pack run over it by
+# semgrep as the unprivileged user with no network, and the findings reported (see "Scan mode").
 # The contract it implements is verifier/contract.md; read that first.
 #
 # Trust model in one paragraph: this script holds a read-only token and a one-time
@@ -69,7 +71,7 @@ if [ -n "${VERIFIER_PROXY_URL:-}" ]; then
     exit 2
   fi
 fi
-RUNNER_VERSION=3
+RUNNER_VERSION=4
 
 EXCERPT_FLOOR=400
 RESULT_BUDGET=56000
@@ -437,6 +439,13 @@ tail_of() { tail -c 3500 "$1" 2>/dev/null | tr -d '\000'; }
 # (the baseline folds several commands into one reported step).
 # Sets LAST_STATUS to pass|fail|timeout|limit|error, plus LAST_DURATION, LAST_EXCERPT,
 # LAST_RC, LAST_LIMIT.
+# STEP_OUT_CAP replaces MAX_OUTPUT_BYTES as the cap on the command's standard output, and
+# STEP_ERR_LOG names a file for its standard error (capped at STEP_ERR_CAP) instead of folding
+# the two together. Scan mode needs both: semgrep's JSON is on standard output and is read
+# whole, so a line of its progress must not land in it. Both are empty for every other step.
+STEP_OUT_CAP=""
+STEP_ERR_LOG=""
+STEP_ERR_CAP=100000
 LAST_STATUS=""
 LAST_DURATION=0
 LAST_EXCERPT=""
@@ -460,6 +469,7 @@ run_step() {
   fi
 
   local started pid reader rc status size duration timed_out=0 spent=0 nap=0.05
+  local out_cap=${STEP_OUT_CAP:-$MAX_OUTPUT_BYTES} err_fifo="" err_reader=""
   started=$(now_ms)
 
   # The output goes through a pipe the runner owns, read by `head`, which stops at the
@@ -467,16 +477,28 @@ run_step() {
   # (not of the step), so it outlives a step that is killed and ends when the last
   # writer is gone.
   mkfifo -m 0600 "$fifo"
-  head -c "$MAX_OUTPUT_BYTES" <"$fifo" >"$log" &
+  head -c "$out_cap" <"$fifo" >"$log" &
   reader=$!
+  if [ -n "$STEP_ERR_LOG" ]; then
+    err_fifo="$OUT/step-$N.err.fifo"
+    mkfifo -m 0600 "$err_fifo"
+    : >"$STEP_ERR_LOG"
+    head -c "$STEP_ERR_CAP" <"$err_fifo" >"$STEP_ERR_LOG" &
+    err_reader=$!
+  fi
 
   # A new session, so one kill to the negative PID reaches the whole group. A background job is not
   # a process group leader, so setsid does not fork and PID is the step's own.
   # The proxy settings of the command (they can hold a secret) reach it through a pipe on
   # descriptor 3, which the command's own shell reads and closes before it runs anything,
   # so they are on no command line, in no file and in no environment but the command's.
-  (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" "$BASH" -c 'while IFS= read -r -d "" kv <&3; do [ -n "$kv" ] && export "$kv"; done; exec 3<&-; exec "$BASH" -c "$1"' sh "$cmd" \
-    </dev/null 3< <(printf '%s\0' "${STEP_PROXY_ENV[@]}")) >"$fifo" 2>&1 &
+  if [ -n "$err_fifo" ]; then
+    (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" "$BASH" -c 'while IFS= read -r -d "" kv <&3; do [ -n "$kv" ] && export "$kv"; done; exec 3<&-; exec "$BASH" -c "$1"' sh "$cmd" \
+      </dev/null 3< <(printf '%s\0' "${STEP_PROXY_ENV[@]}")) >"$fifo" 2>"$err_fifo" &
+  else
+    (cd "$REPO" && exec setsid "${SANDBOX_PREFIX[@]}" "$BASH" -c 'while IFS= read -r -d "" kv <&3; do [ -n "$kv" ] && export "$kv"; done; exec 3<&-; exec "$BASH" -c "$1"' sh "$cmd" \
+      </dev/null 3< <(printf '%s\0' "${STEP_PROXY_ENV[@]}")) >"$fifo" 2>&1 &
+  fi
   pid=$!
 
   while kill -0 "$pid" 2>/dev/null; do
@@ -503,16 +525,26 @@ run_step() {
   kill "$reader" 2>/dev/null
   wait "$reader" 2>/dev/null
   rm -f "$fifo"
+  if [ -n "$err_reader" ]; then
+    spent=0
+    while kill -0 "$err_reader" 2>/dev/null && [ "$spent" -lt 50 ]; do
+      sleep 0.1
+      spent=$((spent + 1))
+    done
+    kill "$err_reader" 2>/dev/null
+    wait "$err_reader" 2>/dev/null
+    rm -f "$err_fifo"
+  fi
 
   duration=$(($(now_ms) - started))
   size=$(wc -c <"$log")
 
   if [ "$timed_out" -eq 1 ]; then
     status=timeout
-  elif [ "$size" -ge "$MAX_OUTPUT_BYTES" ]; then
+  elif [ "$size" -ge "$out_cap" ]; then
     status=limit
     LAST_LIMIT=output
-    printf '\n[verifier] output limit of %s bytes reached; the step was cut off\n' "$MAX_OUTPUT_BYTES" >>"$log"
+    printf '\n[verifier] output limit of %s bytes reached; the step was cut off\n' "$out_cap" >>"$log"
   elif [ "$rc" -eq 137 ]; then
     # Killed with SIGKILL, and not by this runner's own clock: the kernel's out of
     # memory killer is what does that to a step.
@@ -1539,6 +1571,213 @@ session_main() {
 }
 
 # ---------------------------------------------------------------------------
+# Scan mode (runner version 4). One clone at a pinned commit, semgrep with the platform's rule
+# pack over the tree, the findings reported once. Nothing of the repository is run: no `setup`,
+# `test` or other command of a profile reaches this mode (a bootstrap that carries `steps` or
+# `files` has them ignored), and the only program started over the tree is semgrep, which parses
+# files and executes none of them. It runs like every command does (the unprivileged user, its
+# own session, a rebuilt environment, ended with everything it started) and with no proxy
+# variable at all, so it has no network. The repository token is used for the clone alone and
+# is gone from the process before semgrep starts; the platform is told the clone is over, as it
+# is told setup is over in a run, and revokes the token there. The tree is checked afterwards:
+# a scan that changed it is not reported.
+# ---------------------------------------------------------------------------
+SCAN_MAX_FINDINGS=1000
+SCAN_TEXT_CHARS=2000
+SCAN_MESSAGE_CHARS=500
+SCAN_JSON_CAP=67108864
+SCAN_ERR_FILE="$OUT/semgrep.err"
+
+# The bootstrap of a scan: a pinned commit (never "the repository's HEAD"), where to report, the
+# end-of-clone message, and a rule pack.
+SCAN_VALID='
+  ((.repo_url | type) == "string") and (.repo_url | length > 0)
+  and ((.base_sha | type) == "string") and (.base_sha | test("^([0-9a-f]{40}|[0-9a-f]{64})$"))
+  and ((.result_url | type) == "string") and (.result_url | length > 0)
+  and ((.setup_done_url | type) == "string") and (.setup_done_url | length > 0)
+  and ((.analysis | type) == "object") and ((.analysis.files | type) == "object") and (.analysis.files | length >= 1)
+  and (((.wall_clock_seconds // 900) | type) == "number")
+'
+
+# The files a finding can be about must be plain relative paths inside the tree.
+SCAN_FINDINGS_JQ='
+  [ .results[]
+    | select((.path | type) == "string" and (.check_id | type) == "string"
+             and (.start.line | type) == "number" and (.end.line | type) == "number")
+    | {rule_id: .check_id, path: (.path | ltrimstr("./")), start_line: (.start.line | floor),
+       end_line: (.end.line | floor), message: ((.extra.message // "") | tostring)}
+    | select(.start_line >= 1 and .end_line >= .start_line
+             and (.path | length) > 0 and (.path | length) <= 1024 and (.rule_id | length) <= 200)
+    | select((.path | test("^/|(^|/)[.][.](/|$)|(^|/)[.]git(/|$)|[\n\r]")) | not) ]
+  | sort_by([.path, .start_line, .rule_id])
+'
+
+# Read as the unprivileged user, in the tree: for each finding (path in base64, first and last
+# line) the lines it covers, in base64, one output line each, empty when the path is not a plain
+# file inside the tree (a link, or anything that resolves elsewhere). root never opens a path the
+# repository named.
+SCAN_LINES_SCRIPT='
+here=$(realpath -e .) || exit 1
+while read -r enc first last; do
+  path=$(printf %s "$enc" | base64 -d 2>/dev/null) || path=""
+  if [ -n "$path" ] && [ -f "$path" ] && [ ! -L "$path" ] && [ "$(realpath -e -- "$path" 2>/dev/null)" = "$here/$path" ]; then
+    sed -n "${first},${last}p" -- "$path" 2>/dev/null | head -c 8000 | base64 -w0
+  fi
+  echo
+done
+'
+
+# scan_report FILES TRUNCATED: the scan result, uploaded, and the runner's end. The findings are
+# in $OUT/findings-final.json (a list, empty when the scan failed).
+scan_report() {
+  jq -n --slurpfile findings "$OUT/findings-final.json" --argjson files "$1" --argjson truncated "$2" \
+    --arg runner_error "$RUNNER_ERROR" --arg runtime "$RUNTIME" --argjson version "$RUNNER_VERSION" \
+    '{schema: 1, findings: $findings[0], files_scanned: $files, truncated: $truncated,
+      runner: {runtime: $runtime, version: $version}}
+     + (if $runner_error == "" then {} else {runner_error: $runner_error} end)' >"$OUT/scan-result.json"
+  if put_json "$RESULT_CONFIG" "$OUT/scan-result.json"; then
+    log "result accepted"
+    exit 0
+  fi
+  case "$PUT_CODE" in 000 | 5??) ;; *) log "result refused ($PUT_CODE)" ;; esac
+  exit 1
+}
+
+scan_fail() {
+  RUNNER_ERROR=$1
+  log "$1"
+  printf '[]' >"$OUT/findings-final.json"
+  scan_report 0 false
+}
+
+# The proxy credentials of a scan: the runner's own, for the clone and for the platform. There is
+# no `setup` secret and never a `checks` one, so nothing but the runner reaches the network.
+read_scan_proxy_credentials() {
+  [ -n "$PROXY_ENDPOINT" ] || return 0
+  json_string "$1" '.proxy.user'
+  PROXY_USER=$REPLY
+  json_string "$1" '.proxy.runner'
+  RUNNER_CRED=$REPLY
+  if [ -n "$PROXY_USER" ] && [ -n "$RUNNER_CRED" ]; then
+    proxy_url "$PROXY_USER" "$RUNNER_CRED"
+    RUNNER_PROXY_URL=$REPLY
+  else
+    PROXY_USER="" RUNNER_CRED="" RUNNER_PROXY_URL=""
+  fi
+}
+
+scan_main() {
+  local result_url wall_clock cmd rc files_scanned truncated total errors_cut detail errors_text
+  json_string "$BOOTSTRAP_FILE" '.result_url'
+  result_url=$REPLY
+  if [ -z "$result_url" ]; then
+    log "the scan bootstrap names no result URL; nothing can be reported"
+    exit 1
+  fi
+  read_scan_proxy_credentials "$BOOTSTRAP_FILE"
+  if ! curl_config "$RESULT_CONFIG" "$result_url"; then exit 1; fi
+  log "scan mode"
+
+  printf '[]' >"$OUT/findings-final.json"
+  if [ -n "$PROXY_ENDPOINT" ] && [ -z "$PROXY_USER" ]; then
+    scan_fail "the scan bootstrap carries no proxy credentials, so nothing can be fetched"
+  fi
+  if ! jq -e "$SCAN_VALID" "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
+    scan_fail "the scan bootstrap is not what the contract says"
+  fi
+  REPO_URL=$(jq -r '.repo_url' "$BOOTSTRAP_FILE")
+  REPO_TOKEN=$(jq -r '.repo_token // ""' "$BOOTSTRAP_FILE")
+  BASE_SHA=$(jq -r '.base_sha' "$BOOTSTRAP_FILE")
+  wall_clock=$(jq -r '.wall_clock_seconds // 900 | floor' "$BOOTSTRAP_FILE")
+  json_string "$BOOTSTRAP_FILE" '.setup_done_url'
+  SETUP_DONE_URL=$REPLY
+  RULES_JSON=$(jq -c '.analysis.files' "$BOOTSTRAP_FILE")
+  # The token has been read; the response that carried it is not kept.
+  rm -f "$BOOTSTRAP_FILE"
+
+  case "$wall_clock" in '' | *[!0-9]*) wall_clock=900 ;; esac
+  # The upload needs its own thirty seconds at the end.
+  DEADLINE=$((wall_clock - 30))
+  NETWORK=false
+  SETUP_CRED=""
+  CHECKS_CRED=""
+  use_step_env checks
+
+  if [ -n "$RUNNER_ERROR" ]; then scan_fail "$RUNNER_ERROR"; fi
+  if ! rules_valid; then scan_fail "the bootstrap's rule pack is not what the contract says"; fi
+
+  if ! do_clone; then scan_fail "the repository could not be cloned"; fi
+  # The token is gone from this process (do_clone unset it). The platform revokes it here, and
+  # semgrep does not start unless it has taken the message.
+  if ! setup_done; then scan_fail "the platform did not accept the end of the clone, so semgrep was not run"; fi
+  # An answer that carried a `checks` secret is not used: a scan has no network after the clone.
+  CHECKS_CRED=""
+  use_step_env checks
+  write_rules
+
+  cmd="GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false"
+  cmd+=" exec semgrep scan --config $RULES_DIR_QUOTED --json --quiet --metrics=off --timeout 30 --max-target-bytes 1000000"
+  cmd+=" --disable-version-check --oss-only --no-rewrite-rule-ids ."
+  STEP_OUT_CAP=$SCAN_JSON_CAP STEP_ERR_LOG=$SCAN_ERR_FILE run_step semgrep "$cmd" "" no no
+  local json="$OUT/step-$N.log"
+  case "$LAST_STATUS" in
+    timeout) scan_fail "the scan ran out of time: semgrep was cut off by the run's clock" ;;
+    limit)
+      if [ "$LAST_LIMIT" = memory ]; then
+        scan_fail "semgrep was killed, most likely for running out of memory"
+      fi
+      scan_fail "semgrep's output was over the limit of $SCAN_JSON_CAP bytes"
+      ;;
+  esac
+  rc=$LAST_RC
+  if [ "$rc" = 127 ]; then scan_fail "semgrep is not installed in this image, so nothing was scanned"; fi
+  if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then
+    # semgrep says why a rule pack it refuses on standard output (the JSON's errors) and why
+    # anything else failed on standard error.
+    detail=$(tail -c 1000 "$SCAN_ERR_FILE" 2>/dev/null | tr -d '\000')
+    errors_text=$(jq -r '[.errors[]? | (.long_msg // .short_msg // .message // empty)] | .[:3] | join("; ")' "$json" 2>/dev/null | head -c 500)
+    scan_fail "semgrep failed (exit $rc): ${detail}${detail:+${errors_text:+; }}${errors_text}"
+  fi
+
+  # Nothing may have been written into the tree. The listing is the runner's own: modified,
+  # deleted and untracked paths, ignored ones included.
+  OP_STDOUT="$OUT/tree-changes.z" sandbox_op "${GIT[@]}" ls-files -z --others --modified --deleted
+  rc=$?
+  OP_STDOUT=/dev/null
+  if [ "$rc" -ne 0 ]; then scan_fail "the work tree could not be checked after the scan"; fi
+  if [ -s "$OUT/tree-changes.z" ]; then scan_fail "semgrep changed the work tree, so its result was not reported"; fi
+
+  if ! jq -e '(type == "object") and (.results | type == "array") and (.paths.scanned | type == "array")' "$json" >/dev/null 2>&1; then
+    scan_fail "semgrep's output could not be read"
+  fi
+  files_scanned=$(jq '.paths.scanned | length' "$json")
+  errors_cut=$(jq '[.errors[]? | select((.type | tojson) | test("Timeout|OutOfMemory|Out of memory|Too many"; "i"))] | length > 0' "$json")
+  jq -c "$SCAN_FINDINGS_JQ" "$json" >"$OUT/findings-all.json"
+  total=$(jq 'length' "$OUT/findings-all.json")
+  truncated=false
+  if [ "$total" -gt "$SCAN_MAX_FINDINGS" ] || [ "$errors_cut" = true ]; then truncated=true; fi
+  jq -c --argjson max "$SCAN_MAX_FINDINGS" '.[:$max]' "$OUT/findings-all.json" >"$OUT/findings.json"
+
+  jq -r '.[] | [(.path | @base64), (.start_line | tostring),
+                ((if .end_line > .start_line + 49 then .start_line + 49 else .end_line end) | tostring)] | join(" ")' \
+    "$OUT/findings.json" >"$OUT/lines.in"
+  OP_STDIN="$OUT/lines.in" OP_STDOUT="$OUT/lines.out" sandbox_op "$BASH" -c "$SCAN_LINES_SCRIPT" bash
+  rc=$?
+  OP_STDIN=/dev/null
+  OP_STDOUT=/dev/null
+  if [ "$rc" -ne 0 ]; then scan_fail "the matched lines could not be read"; fi
+  jq -Rn '[inputs]' "$OUT/lines.out" >"$OUT/texts.json"
+
+  jq -c --slurpfile texts "$OUT/texts.json" --argjson chars "$SCAN_TEXT_CHARS" --argjson mchars "$SCAN_MESSAGE_CHARS" '
+    def clean: explode | map(select(. == 9 or . == 10 or (. >= 32 and . != 127))) | implode;
+    . as $findings
+    | [range(0; length) | $findings[.]
+       + {text: (($texts[0][.] // "") | (try @base64d catch "") | clean | .[0:$chars])}
+       | .message |= (clean | .[0:$mchars])]' "$OUT/findings.json" >"$OUT/findings-final.json"
+  scan_report "$files_scanned" "$truncated"
+}
+
+# ---------------------------------------------------------------------------
 # The bootstrap: one GET of the one URL the task was started with. Everything the
 # task needs comes back over HTTPS and nothing of it was in the RunTask request. The
 # URL goes to curl through a file, like the result URL later. ?runner=3 tells the
@@ -1589,6 +1828,11 @@ esac
 
 if jq -e '(.session | type) == "object"' "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
   session_main
+  exit 0
+fi
+
+if jq -e '.mode == "scan"' "$BOOTSTRAP_FILE" >/dev/null 2>&1; then
+  scan_main
   exit 0
 fi
 

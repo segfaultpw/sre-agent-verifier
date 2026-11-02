@@ -12,6 +12,12 @@ session (see "Session mode (runner version 3)" below). A run is unchanged by tha
 version 3 runner given a run bootstrap does what a version 2 runner did, and a version 2
 platform keeps working against a version 3 runner.
 
+A runner of version 4 can also serve a **scan**: one container start, one clone of a
+repository at a pinned commit, the platform's static analysis rules run over it by semgrep, and
+the findings reported once (see "Scan mode (runner version 4)" below). Runs and sessions are
+unchanged by that: a version 4 runner given a run or a session bootstrap does what a version 3
+runner did. A scan runs none of the repository's commands.
+
 The platform starts the task, mints the token and URLs, serves the two URLs and judges
 what a result may contain. This file is the other half: what the runner reads, what it
 does and what it sends back.
@@ -39,10 +45,11 @@ of the result URL below.
 
 ## The bootstrap response
 
-The runner fetches the bootstrap with the query parameter `runner=3` (its version) added to
+The runner fetches the bootstrap with the query parameter `runner=4` (its version) added to
 the URL, every time. A version 2 platform ignores the parameter. A platform that can serve
-sessions gives a session only to a request that carries it, so a runner that does not know
-what a session is is never given one.
+sessions gives a session only to a request that carries `runner=3` or more, and one that can
+serve scans gives a scan only to a request that carries `runner=4` or more, so a runner that
+does not know what a session or a scan is is never given one.
 
 ```json
 {
@@ -106,7 +113,7 @@ The runner reads no other environment variable.
 | `setup` | once, on the unmodified tree, before anything is judged |
 | `test` | the repository's tests: first on the unmodified tree (the baseline), then again after the patch |
 | `check` | formatter, linter, after the patch |
-| `analysis` | static analysis on the files the patch touches, after the checks and before the tests (at most four). Its findings are evidence for the person reading the pull request and never a verdict: a nonzero exit is a `fail` step that the platform shows as "findings" and does not count against the change. Exit 127, the shell's "command not found", is reported `skipped`: the tool is not in this image, which is not a finding |
+| `analysis` | static analysis on the files the patch touches, after the checks and before the tests (at most four). Its findings are evidence for the person reading the pull request and never a verdict: a nonzero exit is a `fail` step that the platform shows as "findings" and does not count against the change. Exit 127, the shell's "command not found", is reported `skipped`: the tool is not in this image, which is not a finding. Every image carries `semgrep` (see "Images"), on the PATH of the commands; a rule pack's rules are read from `{rules_dir}` |
 | `new_test` | only the new test files: on the tree with only the patch's test files applied, expecting it to fail, then after the full patch, expecting it to pass |
 
 Command names are `[a-z][a-z0-9_]{0,39}` and never `baseline`, `new_test_fails_before`,
@@ -496,6 +503,125 @@ volume, a `tmpfs`) is the operator's to account for. Separately from persistence
 executes anything from a place the unprivileged user can write**, restored or not: see "What the
 runner executes".
 
+## Scan mode (runner version 4)
+
+A scan reads one repository at one commit with the platform's static analysis rules and reports
+what the rules match. It exists for repositories too large for the platform to read in
+pieces: the platform starts the same image on the hosted verifier, as it starts a run.
+
+**A scan runs none of the repository's commands.** No `setup`, `check`, `test`, `new_test` or
+`analysis` command of a profile reaches this mode, a scan bootstrap that carries `steps` or
+`files` has them ignored, and the only program started over the tree is semgrep, which parses
+the files it is pointed at and runs none of them. It is started like every command is (the
+unprivileged `sandbox` user, in its own session, with a rebuilt environment, ended with everything
+it started) and is given **no proxy variable at all**: no network, whatever the task definition
+sets. Nothing is written back to the repository: the runner makes no commit, no push and no
+request but its own, and a scan that changed the work tree is not reported.
+
+```json
+{
+  "mode": "scan",
+  "repo_url": "https://github.com/<owner>/<repo>.git",
+  "repo_token": "a read-only GitHub installation token for this one repository",
+  "base_sha": "the commit to scan, 40 or 64 lower-case hexadecimal characters",
+  "result_url": "a one-time PUT that takes the scan result",
+  "setup_done_url": "a one-time PUT the runner makes once the clone has ended",
+  "wall_clock_seconds": 1800,
+  "analysis": {"rule_pack": "v1-3fa9c012", "files": {"missing-timeouts.yml": "rules: ..."}},
+  "proxy": {"user": "run:<id>", "runner": "<secret>"}
+}
+```
+
+* `mode` is `"scan"`. A bootstrap with no `mode`, or any other value, is a run (or a session)
+  bootstrap as before.
+* `base_sha` is required and is a commit id (a scan never reads "the repository's `HEAD`");
+  `result_url` and `setup_done_url` are required, and `analysis.files` is the platform's rule
+  pack: the same shape and limits as a run's (at most 20 files named `[a-z0-9][a-z0-9-]{0,60}.yml`,
+  each a string of at most 20,000 bytes), and at least one file. A bootstrap that is not this
+  shape is reported on `result_url` as a `runner_error` before anything is cloned, and the
+  runner exits `0`. `max_output_bytes` is not read: semgrep's output has the caps below.
+* `proxy` holds the runner's own credential, `user` and `runner`, and nothing else is used: a
+  scan has no `setup` secret and never receives a `checks` secret (an answer to `setup_done_url`
+  that carries one is ignored). On the hosted verifier a scan bootstrap without both is
+  reported as a `runner_error` before anything is fetched. Without `VERIFIER_PROXY_URL` (a
+  runner of your own) the task definition's network rules decide what the runner itself reaches,
+  and semgrep gets none of it.
+
+What the runner does, in this order:
+
+1. The same start as a run: it must start as root with an unprivileged user, and refuses
+   (`runner_error`, exit `0` once the result URL is known) otherwise.
+2. Fetches the bootstrap once, with `runner=4`, and checks it (above).
+3. Clones `base_sha` as a run does, into the root-owned staging directory, with the token given
+   to that one command through git's environment, and hands the tree to the unprivileged user.
+   A clone that fails is a `runner_error` ("the repository could not be cloned").
+4. The token is gone from the runner's process after the clone. The runner then `PUT`s `{}` to
+   `setup_done_url`, and **the platform revokes the clone token there**. A platform that does not
+   take the message (any answer but a 2xx) gets a `runner_error` and **semgrep is not started**:
+   the token may still be live.
+5. Writes the rule pack, as root and mode 0644, to `$WORK/rules`, a directory the unprivileged
+   user cannot write to.
+6. Runs, in the clone's root, as the unprivileged user:
+
+   ```
+   semgrep scan --config <rules dir> --json --quiet --metrics=off --timeout 30 --max-target-bytes 1000000 \
+     --disable-version-check --oss-only --no-rewrite-rule-ids .
+   ```
+
+   with git's system and global configuration off and its hooks and file system monitor
+   switched off, under the run's clock (`wall_clock_seconds` minus 30 seconds for the upload).
+   Standard output (semgrep's JSON, at most 64 MiB) and standard error (at most 100,000 bytes)
+   are kept apart, so a line of progress is never in the JSON. Exit `0` and `1` are a scan; the
+   clock, the output cap, the kernel's out-of-memory kill, exit `127` (the shell's "command not
+   found": the tool is not in this image, the scan's counterpart of a `skipped` analysis step) and
+   any other status are each a `runner_error` that says so, with the tail of standard error and
+   the first errors semgrep put in its JSON (that is where it says why it refused a rule) for
+   the last. semgrep's own ignore rules apply (its default list leaves out `test/`, `tests/`,
+   `vendor/`, `node_modules/`, minified files and the like), and so do a repository's own
+   `.semgrepignore` and `nosem` comments: they are the repository's choice of what its scan
+   sees. A rule's `fix:` is never applied.
+7. Checks the tree is the commit it cloned: the runner lists (as the unprivileged user) every
+   modified, deleted and untracked path, ignored ones included, and a scan that left any is a
+   `runner_error` with no findings.
+8. Reads the lines each finding covers from the tree **as the unprivileged user**: a path that is
+   not a plain file inside the tree (a symbolic link, anything that resolves elsewhere) gets an
+   empty `text`, and root never opens a path the repository named.
+9. `PUT`s the result to `result_url` once, and exits `0`; a refused upload exits `1`.
+
+The result:
+
+```json
+{
+  "schema": 1,
+  "findings": [
+    {"rule_id": "missing-timeouts", "path": "lib/client.py", "start_line": 41, "end_line": 41,
+     "text": "    resp = requests.get(url)\n", "message": "this call has no timeout"}
+  ],
+  "files_scanned": 412,
+  "truncated": false,
+  "runner": {"runtime": "python", "version": 4},
+  "runner_error": "only when the scan did not happen"
+}
+```
+
+* `rule_id` is the `id` of the rule in the pack (the runner asks semgrep not to prefix it with the
+  rules directory), at most 200 characters. `path` is relative to the clone (at most 1,024
+  characters, never absolute, never with a `..` or `.git` part). `start_line` and `end_line` are
+  semgrep's own, from 1.
+* `text` is the matched source, from `start_line` through `end_line` (at most 50 lines of it),
+  at most 2,000 characters, with control characters other than tab and line feed removed and bytes
+  that are not UTF-8 replaced. `message` is the rule's message, at most 500 characters. Both are
+  the repository's and the pack's text and **untrusted**: the platform redacts them, and checks the
+  range against the file before it believes a finding.
+* Findings are ordered by path, line and rule, and at most 1,000 are reported. `truncated` is
+  `true` when more were found than that, or when semgrep reported that it gave up on a file or a
+  rule (a timeout or running out of memory): the scan is then not the whole answer.
+* `files_scanned` is the number of files semgrep read (its `paths.scanned`).
+* `runner_error` is present exactly when the scan did not happen or its result cannot be trusted,
+  and then `findings` is `[]`, `files_scanned` is `0` and `truncated` is `false`. **A report with a
+  `runner_error` is never "nothing found."**
+* The report holds no URL or token. `runner.version` is `4`.
+
 ## Running it in your own account
 
 The runner is the same image and the same contract. Only the starter differs: instead of
@@ -590,6 +716,19 @@ image: `pip freeze` still prints `pip==X` and `pip-compile` and `pip-sync` still
 rebuilt pip also replaces the wheel `python -m venv` seeds from (`ensurepip`'s bundled
 wheel), so such a venv carries the fixed libraries too, while virtualenv, tox and uv do not
 use that wheel.
+Every image also carries **semgrep**, the tool the scan mode runs and a profile's `analysis`
+commands can use (`images/*/Dockerfile` runs `semgrep/install-semgrep.sh`, with the release and
+the standalone Python written in each Dockerfile). Nothing is resolved or trusted by name at build time: the interpreter is
+python-build-standalone's CPython 3.13 for glibc Linux, checked against the sha256 in
+`semgrep/python-standalone.lock` before it is unpacked, and every Python package (semgrep's wheel
+carries its `semgrep-core` engine) is installed from `semgrep/semgrep.lock` with
+`--require-hashes --only-binary :all: --no-deps`, then compared with the lock (so nothing is
+missing or extra). The Python lives under `/opt/semgrep`, away from the image's own Python (five of
+the six images have none), pip is removed afterwards, everything is root's and closed to group and
+other, and `/usr/local/bin/semgrep` is a root-owned wrapper that runs semgrep's entry point under
+`python -I` with metrics and the version check off. Nothing is fetched when it runs; it parses
+files and runs none of them. It adds about 450 MB to an image, nearly all of it `semgrep-core`.
+
 `verifier/test/contract.sh` runs the contract against a local fixture repository inside an
 image, including that a command sees none of the runner's variables and cannot read the
 runner's `/proc/<pid>/environ`, that a daemon with its own session is dead when its step
@@ -616,7 +755,79 @@ boot and two jobs; and it proves that the runner refuses to start when a program
 a directory it looks that program up in, or a link on the way is group or other writable.
 `tests/test_session.py` and `tests/test_session_network.py` run the session cases, and
 `tests/test_root_path.py` the planted-program and ownership cases, and the
-back-off table, against `run.sh` without Docker.
+back-off table, against `run.sh` without Docker. For scan mode it runs the real semgrep in every
+image, as the unprivileged user on a read-only tree with no network at all (it finds what a rule
+says, and code planted in the tree, including modules named like the ones semgrep imports, is
+never imported or run), checks the install (the pinned release, root's and unwritable, no pip,
+no new `python3` on the PATH), runs a scan bootstrap end to end (the documented findings with
+their lines, a rule with an autofix changing no file, the work tree exactly the pinned commit
+afterwards, no URL or secret on any command line, the clone-over message stored before the
+result) and shows that a rule pack semgrep refuses is a `runner_error`; `tests/test_scan.py`
+drives the same runner code against a stand-in for semgrep, without Docker, for everything the
+runner decides (the bootstrap checks, the order, what semgrep is and is not given, the caps and the
+selection of findings, the failure reports, the hosted proxy credential).
+
+### Bumping semgrep, or the Python it runs on
+
+`semgrep/semgrep.lock` and `semgrep/python-standalone.lock` are generated; the release and the
+interpreter are written in each of the six Dockerfiles (`--python VERSION+TAG --semgrep VERSION`,
+one line, which `tests/test_semgrep.py` requires to be the same in all six and to match both
+locks). A bump is edits in the order below. `V` is the semgrep release, `P+T` the Python version
+and python-build-standalone release.
+
+1. Regenerate `semgrep.lock` for `V` with any CPython 3.13 on Linux (the hashes cover every file of
+   every pin, so the machine does not matter; a different Python minor version needs the
+   `python3.13` paths in `contract.sh` and the lock regenerated for it):
+
+   ```bash
+   cd verifier/semgrep
+   python3.13 -m venv ~/.cache/semgrep-lock && ~/.cache/semgrep-lock/bin/pip install pip-tools
+   printf 'semgrep==V\n' > ~/.cache/semgrep-lock/semgrep.in
+   ~/.cache/semgrep-lock/bin/pip-compile --generate-hashes --strip-extras --allow-unsafe --no-header --quiet \
+     -o ~/.cache/semgrep-lock/body.lock ~/.cache/semgrep-lock/semgrep.in
+   { grep '^#' semgrep.lock; cat ~/.cache/semgrep-lock/body.lock; } > ~/.cache/semgrep-lock/new.lock
+   mv ~/.cache/semgrep-lock/new.lock semgrep.lock
+   ```
+
+2. Check the wheels exist for both architectures (a package that has no `manylinux` wheel for
+   CPython 3.13 on `aarch64` fails the arm64 leg only):
+
+   ```bash
+   for platform in manylinux_2_34_x86_64 manylinux_2_34_aarch64; do
+     python3.13 -m pip download --require-hashes --only-binary :all: --no-deps -r semgrep.lock \
+       -d ~/.cache/semgrep-wheels-$platform --platform "$platform" --platform manylinux_2_28_${platform#*_*_} \
+       --platform manylinux2014_${platform#*_*_} --python-version 3.13 --implementation cp --abi cp313 --abi abi3 --abi none
+   done
+   ```
+
+3. For a new interpreter: take both `install_only_stripped` lines of the release's `SHA256SUMS`
+   (`https://github.com/astral-sh/python-build-standalone/releases/download/T/SHA256SUMS`, files
+   `cpython-P+T-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz` and the `aarch64` one)
+   into `python-standalone.lock`, in the file's `<sha256>  <file name>` form.
+4. Set `--semgrep V` (and `--python P+T`) in all six Dockerfiles.
+5. Run `python3 -I -m unittest discover -s tests`, `verifier/test/contract.sh RUNTIME` for every
+   runtime, and the Trivy step as the workflow runs it. A pin Trivy reports as fixable HIGH or
+   CRITICAL is raised in `semgrep.in` by constraint (`pip-compile` then keeps the rest).
+
+### The shared static analysis corpus
+
+The platform defines each of its built-in static classes twice, as a semgrep rule file and as an
+Elixir matcher, and holds both to one corpus of small files: a `positive` set the class must flag
+and a `negative` set it must not. The platform keeps it at
+`apps/sre_core/priv/code_analysis/rules/<class>.yml` and
+`apps/sre_core/priv/code_analysis/fixtures/<class>/{positive,negative}/`; this repository keeps a
+committed copy at `verifier/test/corpus/` (`rules/` and `fixtures/` with the same layout), and
+`verifier/test/contract.sh` runs semgrep over it inside every image, as the unprivileged user, with
+no network: the class's rule must flag every positive fixture and none of the negative ones, so
+the two engines cannot disagree silently. The copy is made by
+`verifier/sync-fixtures.sh PLATFORM_REPOSITORY` (which refuses a corpus that is not well formed:
+a class needs a rule and both fixture sets, no links, no file over 200 KB) and checked by
+`verifier/sync-fixtures.sh --check PLATFORM_REPOSITORY`, which fails on any file added, removed or
+changed on either side. The workflow runs the check when the repository variable
+`PLATFORM_CORPUS_PATH` names a checkout of the platform repository on the runner, and skips it
+otherwise (the platform repository is private); a platform without a corpus yet is reported as
+such and is not a failure. The corpus is public, as this repository is: it holds no customer,
+organization or account name.
 
 ### The one scanner exception: pip's `pkg_resources` (CVE-2025-47273)
 
