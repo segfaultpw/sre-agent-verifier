@@ -2,7 +2,7 @@
 # Verifier image: Python. Build with the verifier/ directory as the context:
 #   docker build -f verifier/images/python/Dockerfile verifier/
 # The base is pinned by the digest of the multi-arch index (amd64 and arm64).
-FROM python:3.14-slim-trixie@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a
+FROM python:3.14-slim-trixie@sha256:930e1abba7c4e8f96ed93e8012c35d174d7732752731bbd5e8e757d7ec6f3966
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -22,10 +22,9 @@ RUN apt-get update \
 # package is the OpenVEX document in this directory, which the workflow hands to the scan.
 RUN --mount=type=bind,source=images/python,target=/tmp/pip-fix \
     bash /tmp/pip-fix/fix-pip-vendored.sh \
-      --pip-source 26.2.1=634a6ec1a5d9dcc2433571cdb2f4c58a4bb29caf \
+      --pip-source 26.2.2=b3b696fe2122f2339d782517559bfade2cb6b879 \
       --min urllib3==2.8.0 \
-      --min msgpack==1.2.1 \
-      --min certifi==2026.10.19 \
+      --min msgpack==1.2.3 \
       --build-from-sdist msgpack
 
 # No directory the unprivileged user can write may be one root executes from or has on its PATH

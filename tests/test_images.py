@@ -68,7 +68,7 @@ class HardeningTest(unittest.TestCase):
                 at = text.index(run)
                 for later in ("ENTRYPOINT", "ENV VERIFIER_RUNTIME"):
                     self.assertGreater(text.index(later), at, later)
-                for earlier in ("useradd --create-home --uid 10001", "mix local.hex", "fix-npm-bundled.sh", "fix-pip-vendored.sh"):
+                for earlier in ("useradd --create-home --uid 10001", "mix local.hex", "fix-npm-bundled.sh", "fix-pip-vendored.sh", "fix-maven-bundled.sh"):
                     if earlier in text:
                         self.assertLess(text.index(earlier), at, earlier)
 
@@ -231,6 +231,30 @@ class NodeImageFloorsTest(unittest.TestCase):
                 r"\A@?[a-z0-9][a-z0-9._/-]*@\d+\.\d+\.\d+=sha512-[A-Za-z0-9+/]{86}==\Z",
                 "%s has no sha512 integrity" % floor,
             )
+
+
+class JavaImageFloorsTest(unittest.TestCase):
+    def test_every_floor_carries_the_sha256_its_jar_must_have(self):
+        floors = re.findall(r"--min (\S+)", dockerfile("java"))
+        self.assertTrue(floors)
+        for floor in floors:
+            self.assertRegex(
+                floor,
+                r"\A[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*@\d+(\.\d+)+(-[A-Za-z0-9]+)?=[0-9a-f]{64}\Z",
+                "%s has no sha256 digest" % floor,
+            )
+
+    def test_the_script_is_executable_stops_on_error_and_only_ever_fetches_from_maven_central(self):
+        script = IMAGES / "java" / "fix-maven-bundled.sh"
+        text = script.read_text()
+        self.assertTrue(os.access(script, os.X_OK))
+        self.assertIn("set -euo pipefail", text)
+        self.assertIn("central=https://repo1.maven.org/maven2", text)
+        # the only plain-http text is the POM namespace of the smoke build's own pom
+        self.assertEqual(re.findall(r"http://\S+", text), ["http://maven.apache.org/POM/4.0.0\">"])
+        self.assertEqual(
+            dockerfile("java").count("source=images/java/fix-maven-bundled.sh,target=/tmp/fix-maven-bundled.sh"), 1
+        )
 
 
 class ScannerExceptionTest(unittest.TestCase):

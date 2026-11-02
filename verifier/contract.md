@@ -574,15 +574,18 @@ re-points, so the refresh below can move it), for both `amd64` and `arm64`, each
 runner, and published on its own: one runtime failing never stops another. The leg that builds an image contract-tests it, scans it
 and pushes it (`.github/workflows/verifier-images.yml`); Dependabot proposes new base
 digests, and the weekly rebuild re-resolves them itself (`verifier/refresh-bases.sh`).
-The `node` and `python` images also raise the libraries their package manager bundles inside
-itself (npm's `node_modules`, pip's `pip/_vendor`) to the releases the scan wants, because a
-scan reads them as installed packages and no npm or pip release has the fixed ones yet
-(`images/node/fix-npm-bundled.sh` and `images/python/fix-pip-vendored.sh`, with the floors
-written in each Dockerfile). Each step looks at what the base carries first and, once the
-base is new enough, does nothing and fetches nothing. When it has work to do, everything it
-fetches is pinned and checked: the node floors by the sha512 their tarball must have, and the
-python step's pip source by commit and its build tools and bundled libraries by the hashes in
-`pip-fix-tools.lock` and `pip-vendored.lock`. What a repository can observe in the python
+The `node`, `python` and `java` images also raise the libraries their package manager bundles inside
+itself (npm's `node_modules`, pip's `pip/_vendor`, Maven's `lib/`) to the releases the scan wants, because a
+scan reads them as installed packages and no npm, pip or Maven release has the fixed ones yet
+(`images/node/fix-npm-bundled.sh`, `images/python/fix-pip-vendored.sh` and
+`images/java/fix-maven-bundled.sh`, with the floors written in each Dockerfile). Each step looks at
+what the base carries first and, once the base is new enough, does nothing and fetches nothing. When it
+has work to do, everything it fetches is pinned and checked: the node floors by the sha512 their tarball
+must have, the java floors by the sha256 their jar must have (which must also be the checksum Maven
+Central publishes beside it), and the python step's pip source by commit and its build tools and bundled
+libraries by the hashes in `pip-fix-tools.lock` and `pip-vendored.lock`. A new java floor is one
+`--min GROUP:ARTIFACT@VERSION=SHA256` line, whose digest is the `.sha256` file beside the jar on Maven
+Central. What a repository can observe in the python
 image: `pip freeze` still prints `pip==X` and `pip-compile` and `pip-sync` still run; the
 rebuilt pip also replaces the wheel `python -m venv` seeds from (`ensurepip`'s bundled
 wheel), so such a venv carries the fixed libraries too, while virtualenv, tox and uv do not
@@ -657,7 +660,7 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
    `--pip-source <version>=<40 hex>`, so nothing else names the version. If the new pip already
    carries a `--min` floor, delete that floor from the Dockerfile.
 2. Regenerate `pip-vendored.lock` from that commit's `vendor.txt`, with each `--min` floor applied
-   where `vendor.txt` is below it (the loop below applies urllib3 2.8.0, msgpack 1.2.1 and certifi 2026.10.19, and
+   where `vendor.txt` is below it (the loop below applies urllib3 2.8.0 and msgpack 1.2.3, and
    builds msgpack from its sdist, as the Dockerfile says), keeping the comment header:
 
    ```bash
@@ -665,7 +668,7 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
    SHA=<the commit from step 1>
    SDISTS="msgpack"   # the Dockerfile's --build-from-sdist names
    curl -sf "https://raw.githubusercontent.com/pypa/pip/$SHA/src/pip/_vendor/vendor.txt" |
-     sed -E 's/^(\s*)urllib3==.*/\1urllib3==2.8.0/; s/^msgpack==.*/msgpack==1.2.1/; s/^(\s*)certifi==.*/\1certifi==2026.10.19/' > /tmp/vendor.txt
+     sed -E 's/^(\s*)urllib3==.*/\1urllib3==2.8.0/; s/^msgpack==.*/msgpack==1.2.3/' > /tmp/vendor.txt
    { grep '^#' pip-vendored.lock
      sed -nE 's/^[[:space:]]*([A-Za-z0-9._-]+)==([^[:space:]#]+).*/\1 \2/p' /tmp/vendor.txt |
      while read -r name version; do
@@ -691,5 +694,6 @@ pair in `images/python/Dockerfile`, so a bump is that edit plus two regeneration
 Then run `python3 -I -m unittest discover -s tests`, `verifier/test/contract.sh
 python`, and the Trivy step as the workflow runs it. Both commands above were run against the pinned
 pip 26.2.1 and reproduce the committed bodies of `pip-vendored.lock` and `pip-fix-tools.lock` byte for
-byte. The node image needs no such procedure: a new floor is one `--min NAME@VERSION=sha512-...` line,
+byte (the 26.2.2 bump re-ran the first against that commit and left the second as it was, because the
+`vendoring` requirement of its noxfile is unchanged). The node image needs no such procedure: a new floor is one `--min NAME@VERSION=sha512-...` line,
 whose integrity is `npm view NAME@VERSION dist.integrity`.
