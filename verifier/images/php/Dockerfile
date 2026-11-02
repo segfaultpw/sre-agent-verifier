@@ -3,9 +3,9 @@
 # context:
 #   docker build -f verifier/images/php/Dockerfile verifier/
 # Both bases are pinned by the digest of their multi-arch index (amd64 and arm64).
-FROM composer:2@sha256:af98f42dfff7c68ba8d53c2164fd9fde1087b7d449514baa38c418b1f6bc4bac AS composer
+FROM composer:2@sha256:4ed71c38c6d788eb4e4e3747b5332f5b40d5b5a6fcadd5062a1a70986a118e0a AS composer
 
-FROM php:8.5-cli-trixie@sha256:c8266eb43a912656e23766f8b39d85433cb4d4cd163fb9716b9649cb4411f527
+FROM php:8.5-cli-trixie@sha256:9236fd373d3bcda0659cf94838a744bd79791419292958963f8c6b34a0071554
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
