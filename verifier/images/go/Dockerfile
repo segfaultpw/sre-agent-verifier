@@ -9,7 +9,11 @@
 FROM golang:1.26-trixie@sha256:a050dcceee6eb9bf110151662dfac7662f3bec40927c7dee48731e3d92083d42
 
 ENV DEBIAN_FRONTEND=noninteractive
+# The Debian security archive publishes fixes (linux-libc-dev, CVE-2026-99083 and a run of kernel
+# header advisories) before the base image is rebuilt, and the gate blocks every fixable HIGH, so
+# the installed packages are brought up to the archive's current ones before the tools are added.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends bash ca-certificates curl git jq util-linux coreutils build-essential \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 --shell /bin/bash sandbox \

@@ -68,7 +68,7 @@ class HardeningTest(unittest.TestCase):
                 at = text.index(run)
                 for later in ("ENTRYPOINT", "ENV VERIFIER_RUNTIME"):
                     self.assertGreater(text.index(later), at, later)
-                for earlier in ("useradd --create-home --uid 10001", "mix local.hex", "fix-npm-bundled.sh", "fix-pip-vendored.sh", "fix-maven-bundled.sh"):
+                for earlier in ("useradd --create-home --uid 10001", "mix local.hex", "fix-npm-bundled.sh", "fix-pip-vendored.sh", "fix-maven-bundled.sh", "install-semgrep.sh"):
                     if earlier in text:
                         self.assertLess(text.index(earlier), at, earlier)
 
@@ -164,6 +164,18 @@ class PinnedToolchainTest(unittest.TestCase):
         (ref,) = [m.group(1) for m in froms]
         jdk = int(re.search(r"temurin-(\d+)$", ref).group(1))
         self.assertIn(jdk, [17, 21, 25, 29], "%s is not a long-term support JDK" % ref)
+
+
+class OsPackagesAreCurrentTest(unittest.TestCase):
+    def test_the_images_whose_base_lags_the_security_archive_upgrade_before_they_add_tools(self):
+        # The archive ships kernel header and library fixes before the base image is rebuilt, and the
+        # Trivy gate blocks every fixable HIGH, so go, php (Debian) and java (Ubuntu) bring the
+        # installed packages up to date first.
+        for runtime in ["go", "php", "java"]:
+            with self.subTest(runtime=runtime):
+                text = dockerfile(runtime)
+                self.assertIn("apt-get upgrade -y --no-install-recommends", text)
+                self.assertLess(text.index("apt-get upgrade"), text.index("apt-get install"))
 
 
 class PythonImageInputsTest(unittest.TestCase):

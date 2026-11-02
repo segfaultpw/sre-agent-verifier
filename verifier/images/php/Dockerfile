@@ -8,7 +8,11 @@ FROM composer:2@sha256:4ed71c38c6d788eb4e4e3747b5332f5b40d5b5a6fcadd5062a1a70986
 FROM php:8.5-cli-trixie@sha256:9236fd373d3bcda0659cf94838a744bd79791419292958963f8c6b34a0071554
 
 ENV DEBIAN_FRONTEND=noninteractive
+# The Debian security archive publishes fixes (linux-libc-dev, CVE-2026-99083 and a run of kernel
+# header advisories) before the base image is rebuilt, and the gate blocks every fixable HIGH, so
+# the installed packages are brought up to the archive's current ones before the tools are added.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends bash ca-certificates curl git jq util-linux coreutils build-essential \
     unzip libzip-dev libicu-dev libonig-dev libxml2-dev \
  && docker-php-ext-install -j"$(nproc)" intl zip bcmath pcntl \
