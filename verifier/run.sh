@@ -1586,6 +1586,11 @@ SCAN_MAX_FINDINGS=1000
 SCAN_TEXT_CHARS=2000
 SCAN_MESSAGE_CHARS=500
 SCAN_JSON_CAP=67108864
+# What the platform's result endpoint takes (it refuses a larger body and ends the scan): the runner's
+# report is cut to fit under it, findings first, and says so in `truncated`. The reserve is the room
+# for the envelope (schema, counts, runner) the findings do not include.
+SCAN_REPORT_MAX_BYTES=2000000
+SCAN_REPORT_RESERVE=4096
 SCAN_ERR_FILE="$OUT/semgrep.err"
 
 # The bootstrap of a scan: a pinned commit (never "the repository's HEAD"), where to report, the
@@ -1630,7 +1635,7 @@ done
 # scan_report FILES TRUNCATED: the scan result, uploaded, and the runner's end. The findings are
 # in $OUT/findings-final.json (a list, empty when the scan failed).
 scan_report() {
-  jq -n --slurpfile findings "$OUT/findings-final.json" --argjson files "$1" --argjson truncated "$2" \
+  jq -nc --slurpfile findings "$OUT/findings-final.json" --argjson files "$1" --argjson truncated "$2" \
     --arg runner_error "$RUNNER_ERROR" --arg runtime "$RUNTIME" --argjson version "$RUNNER_VERSION" \
     '{schema: 1, findings: $findings[0], files_scanned: $files, truncated: $truncated,
       runner: {runtime: $runtime, version: $version}}
@@ -1774,6 +1779,15 @@ scan_main() {
     | [range(0; length) | $findings[.]
        + {text: (($texts[0][.] // "") | (try @base64d catch "") | clean | .[0:$chars])}
        | .message |= (clean | .[0:$mchars])]' "$OUT/findings.json" >"$OUT/findings-final.json"
+  # The report is held under the platform's body bound by whole findings, counted in bytes (a
+  # character can be four): a cut is `truncated`, never a body the platform would refuse.
+  jq -c --argjson budget "$((SCAN_REPORT_MAX_BYTES - SCAN_REPORT_RESERVE))" '
+    reduce .[] as $f ({kept: [], bytes: 0, cut: false};
+      ($f | tojson | utf8bytelength + 1) as $n
+      | if .cut or (.bytes + $n > $budget) then .cut = true
+        else .kept += [$f] | .bytes += $n end)' "$OUT/findings-final.json" >"$OUT/findings-fit.json"
+  if [ "$(jq '.cut' "$OUT/findings-fit.json")" = true ]; then truncated=true; fi
+  jq -c '.kept' "$OUT/findings-fit.json" >"$OUT/findings-final.json"
   scan_report "$files_scanned" "$truncated"
 }
 

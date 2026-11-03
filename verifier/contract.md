@@ -616,6 +616,12 @@ The result:
 * Findings are ordered by path, line and rule, and at most 1,000 are reported. `truncated` is
   `true` when more were found than that, or when semgrep reported that it gave up on a file or a
   rule (a timeout or running out of memory): the scan is then not the whole answer.
+* **The report is at most 2,000,000 bytes**, which is what the platform's result endpoint takes
+  (it refuses a larger body and ends the scan `failed`). The report is compact JSON, and the
+  runner keeps the longest run of leading findings whose encoded size, counted in bytes (a
+  character can be four), fits that bound less 4,096 bytes for the rest of the report; a cut is
+  `truncated: true`. The largest possible finding is about 15 KB, so over a hundred always fit; ordinary
+  source (about 3.5 KB a finding) fits about 570.
 * `files_scanned` is the number of files semgrep read (its `paths.scanned`).
 * `runner_error` is present exactly when the scan did not happen or its result cannot be trusted,
   and then `findings` is `[]`, `files_scanned` is `0` and `truncated` is `false`. **A report with a

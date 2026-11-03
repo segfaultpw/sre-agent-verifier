@@ -1,0 +1,51 @@
+{
+  "files_scanned": 5,
+  "findings": [
+    {
+      "end_line": 7,
+      "message": "The action is referenced by a tag or branch.",
+      "path": ".github/workflows/ci.yml",
+      "rule_id": "sre-ci-unpinned-action-github-actions",
+      "start_line": 7,
+      "text": "      - uses: actions/checkout@v4\n"
+    },
+    {
+      "end_line": 1,
+      "message": "A credential is written in the source.",
+      "path": "src/config.py",
+      "rule_id": "sre-hardcoded-secret-assigned",
+      "start_line": 1,
+      "text": "DB_PASSWORD = \"zq81kd7x2mw9v4tb\"\n"
+    },
+    {
+      "end_line": 5,
+      "message": "The query has no filter and no limit.",
+      "path": "src/orders.py",
+      "rule_id": "sre-unbounded-query-python",
+      "start_line": 5,
+      "text": "    for order in Order.objects.all():\n"
+    },
+    {
+      "end_line": 5,
+      "message": "The call has no timeout.",
+      "path": "src/reports.py",
+      "rule_id": "sre-missing-timeout-python-requests",
+      "start_line": 5,
+      "text": "    return requests.get(url)\n"
+    },
+    {
+      "end_line": 5,
+      "message": "An error is caught and thrown away.",
+      "path": "src/store.py",
+      "rule_id": "sre-swallowed-exception-python",
+      "start_line": 2,
+      "text": "    try:\n        write(record)\n    except Exception:\n        pass\n"
+    }
+  ],
+  "runner": {
+    "runtime": "python",
+    "version": 4
+  },
+  "schema": 1,
+  "truncated": false
+}

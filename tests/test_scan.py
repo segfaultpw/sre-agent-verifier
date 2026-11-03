@@ -10,6 +10,7 @@ inside every image, as the real unprivileged user. Standard library only."""
 
 import json
 import os
+import pathlib
 import stat
 import subprocess
 
@@ -83,6 +84,7 @@ class ScanCase(SessionCase):
         (origin / "src").mkdir()
         (origin / "src" / "app.py").write_text(APP)
         (origin / "src" / "wide.txt").write_text("w" * 5000 + "\n")
+        (origin / "src" / "wide4.txt").write_text("\U0001F600" * 5000 + "\n", encoding="utf-8")
         (origin / "src" / "bin.dat").write_bytes(b"a\x00b\xff\xfec\nsecond\n")
         (origin / "src" / "with space.py").write_text("one\ntwo\n")
         os.symlink("/etc/passwd", origin / "link.txt")
@@ -162,6 +164,108 @@ class ScanReportTest(ScanCase):
                 "message": "no timeout",
             },
         )
+
+
+    def report_bytes(self):
+        return (self.results / "result.json").stat().st_size
+
+    def test_a_report_is_cut_to_fit_the_platform_bound_and_says_so(self):
+        # 1000 findings of a full 2000 character text and a full 500 character message are about
+        # 2.7 MB: more than the 2,000,000 bytes the platform's result endpoint takes.
+        results = [("r", "src/wide.txt", 1, 1, "m" * 900) for _ in range(1000)]
+        platform, done = self.scan(results)
+        self.assertRunnerOk(done)
+        result = self.report(platform)
+        self.assertLessEqual(self.report_bytes(), 2_000_000)
+        self.assertTrue(result["truncated"])
+        self.assertLess(len(result["findings"]), 1000)
+        self.assertGreater(len(result["findings"]), 600, "the cut keeps every finding that fits")
+        self.assertGreater(self.report_bytes(), 2_000_000 - 4096 - 3000, "and stops at the bound, not far below it")
+        self.assertNotIn("runner_error", result)
+
+    def test_the_bound_counts_bytes_not_characters(self):
+        # 2000 four-byte characters are 8000 bytes: only about 245 such findings fit.
+        results = [("r", "src/wide4.txt", 1, 1, "m") for _ in range(1000)]
+        platform, done = self.scan(results)
+        self.assertRunnerOk(done)
+        result = self.report(platform)
+        self.assertLessEqual(self.report_bytes(), 2_000_000)
+        self.assertTrue(result["truncated"])
+        self.assertTrue(0 < len(result["findings"]) < 400)
+        self.assertEqual(result["findings"][0]["text"], "\U0001F600" * 2000)
+
+    def test_a_report_under_the_bound_is_not_cut(self):
+        results = [("r", "src/wide.txt", 1, 1, "m" * 900) for _ in range(500)]
+        platform, done = self.scan(results)
+        self.assertRunnerOk(done)
+        result = self.report(platform)
+        self.assertLess(self.report_bytes(), 2_000_000 - 4096)
+        self.assertEqual(len(result["findings"]), 500)
+        self.assertFalse(result["truncated"])
+
+    def test_the_largest_possible_finding_still_fits_many_times(self):
+        # A 200 character rule id, a 2000 character text and a 500 character message, the last two
+        # of four-byte characters: about 10 KB each. The bound leaves room for a hundred of them.
+        results = [("r" * 200, "src/wide4.txt", 1, 1, "\U0001F600" * 900) for _ in range(1000)]
+        platform, done = self.scan(results)
+        self.assertRunnerOk(done)
+        result = self.report(platform)
+        self.assertLessEqual(self.report_bytes(), 2_000_000)
+        self.assertTrue(result["truncated"])
+        self.assertGreater(len(result["findings"]), 100)
+
+    def test_the_report_is_compact_json_so_the_bound_is_what_is_sent(self):
+        platform, done = self.scan([("r", "src/app.py", 1, 1, "m")])
+        self.assertRunnerOk(done)
+        raw = (self.results / "result.json").read_text()
+        self.assertEqual(raw.strip().count("\n"), 0, "one line, no indentation")
+
+
+    SAMPLE_FILES = {
+        "src/reports.py": "import requests\n\n\ndef fetch(url):\n    return requests.get(url)\n",
+        "src/orders.py": "from shop.models import Order\n\n\ndef export():\n    for order in Order.objects.all():\n        print(order)\n",
+        "src/store.py": "def save(record):\n    try:\n        write(record)\n    except Exception:\n        pass\n",
+        "src/config.py": 'DB_PASSWORD = "zq81kd7x2mw9v4tb"\n',
+        ".github/workflows/ci.yml": (
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: actions/checkout@v4\n      - run: make\n"
+        ),
+    }
+    SAMPLE_FINDINGS = [
+        ("sre-ci-unpinned-action-github-actions", ".github/workflows/ci.yml", 7, 7, "The action is referenced by a tag or branch."),
+        ("sre-hardcoded-secret-assigned", "src/config.py", 1, 1, "A credential is written in the source."),
+        ("sre-unbounded-query-python", "src/orders.py", 5, 5, "The query has no filter and no limit."),
+        ("sre-swallowed-exception-python", "src/store.py", 2, 5, "An error is caught and thrown away."),
+        ("sre-missing-timeout-python-requests", "src/reports.py", 5, 5, "The call has no timeout."),
+    ]
+
+    def test_the_report_of_a_scan_is_the_sample_the_platform_repository_pins(self):
+        # tests/fixtures/scan_runner_report.json is copied into the platform repository
+        # (apps/sre_core/test/fixtures/scan_runner_report.json), whose contract test feeds it through
+        # the result validator and compares its findings with the platform's own static engine over the
+        # same files (SAMPLE_FILES, repeated there). Set VERIFIER_UPDATE_FIXTURES=1 to rewrite it.
+        origin = self.origin
+        for name, content in self.SAMPLE_FILES.items():
+            target = origin / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        git(origin, "add", "-A")
+        git(origin, "commit", "-q", "-m", "sample files")
+        sha = git(origin, "rev-parse", "HEAD")
+        platform, done = self.scan(
+            self.SAMPLE_FINDINGS,
+            scanned=sorted(self.SAMPLE_FILES),
+            bootstrap=self.bootstrap(base_sha=sha),
+            extra={"VERIFIER_RUNTIME": "python"},
+        )
+        self.assertRunnerOk(done)
+        report = self.report(platform)
+        sample = pathlib.Path(__file__).parent / "fixtures" / "scan_runner_report.json"
+        if os.environ.get("VERIFIER_UPDATE_FIXTURES") == "1":
+            sample.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        self.assertEqual(report, json.loads(sample.read_text()))
+        self.assertEqual(report["runner"], {"runtime": "python", "version": 4})
+        self.assertEqual(len(report["findings"]), 5)
 
     def test_a_scan_with_nothing_found_reports_an_empty_list_and_the_files_it_read(self):
         platform, done = self.scan([], scanned=["src/app.py", "calc.sh", "README"])
