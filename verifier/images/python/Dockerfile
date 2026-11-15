@@ -2,7 +2,7 @@
 # Verifier image: Python. Build with the verifier/ directory as the context:
 #   docker build -f verifier/images/python/Dockerfile verifier/
 # The base is pinned by the digest of the multi-arch index (amd64 and arm64).
-FROM python:3.14-slim-trixie@sha256:930e1abba7c4e8f96ed93e8012c35d174d7732752731bbd5e8e757d7ec6f3966
+FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
