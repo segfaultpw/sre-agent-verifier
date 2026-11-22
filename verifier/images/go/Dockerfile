@@ -6,7 +6,7 @@
 # patches arriving. The toolchain must be Go 1.26.10 or later (the release that fixes the Go
 # standard library advisories the scan reported against the earlier 1.26 patch releases);
 # verifier/test/contract.sh fails the build of this image when `go version` is older.
-FROM golang:1.26-trixie@sha256:a050dcceee6eb9bf110151662dfac7662f3bec40927c7dee48731e3d92083d42
+FROM golang:1.27-trixie@sha256:f18c3d73a184fb0582828510722e723b63a93f7188d11dd223d9be6f6880e65d
 
 ENV DEBIAN_FRONTEND=noninteractive
 # The Debian security archive publishes fixes (linux-libc-dev, CVE-2026-99083 and a run of kernel
