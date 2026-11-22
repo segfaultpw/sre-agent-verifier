@@ -6,7 +6,7 @@
 # the weekly refresh (verifier/refresh-bases.sh) and Dependabot can move it. The
 # platform's own builder uses hexpm/elixir, whose tags name a dated build and never move;
 # that is why this image does not. Same Elixir and OTP major as the platform builds with.
-FROM elixir:1.20.4-otp-29-slim@sha256:5a0b4f07258208e101486b4bf6d55b7a194622fd10bf6c352602de7a37805637
+FROM elixir:1.20.4-otp-29-slim@sha256:6245171c91cf90808437f203f22856738d0095d310f4f9030219e53111823ff8
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
